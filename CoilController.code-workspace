@@ -1,0 +1,15 @@
+{
+  "folders": [
+    {
+      "name": "STM32 H743",
+      "path": "."
+    },
+    {
+      "name": "ESP32 Bridge",
+      "path": "esp32_bridge"
+    }
+  ],
+  "settings": {
+    "C_Cpp.errorSquiggles": "enabled"
+  }
+}
