@@ -35,21 +35,36 @@ Browser  ──WiFi SoftAP──►  ESP32-S3          Serial Monitor (USB-UART)
 - Soft current limits (`limit`)
 - Dual CLI ports: human Serial Monitor + machine ESP32 bridge (`ping` / `json`)
 - Web UI tabs: **Configuration**, **Motor drivers**, **Logs**
+- Onboard **0.96" ST7735** status UI (per-coil ON/OFF, mag, dir, current)
 
 ## Hardware
 
 ### Coil / BTS7960 pin map (STM32)
 
-| Coil | RPWM | LPWM | EN | IS (ADC) |
-|------|------|------|-----|----------|
-| M1 | PE9 | PE11 | PE8 | PA0 |
-| M2 | PE13 | PE14 | PE10 | PA1 |
-| M3 | PC6 | PC7 | PC5 | PA2 |
-| M4 | PC8 | PC9 | PC4 | PA3 |
-| M5 | PA6 | PA7 | PB10 | PA4 |
-| M6 | PB0 | PB1 | PB11 | PA5 |
+| Coil | RPWM | LPWM | EN | IS (ADC) | Timer |
+|------|------|------|-----|----------|-------|
+| M1 | PD14 | PD15 | PD10 | PA0 | TIM4 |
+| M2 | PE5 | PE6 | PE4 | PA1 | TIM15 |
+| M3 | PC6 | PC7 | PC5 | PA2 | TIM8 |
+| M4 | PC8 | PC9 | PC4 | PA3 | TIM8 |
+| M5 | PA6 | PA7 | PB10 | PA4 | TIM3 |
+| M6 | PB0 | PB1 | PB11 | PA5 | TIM3 |
+
+M1/M2 were remapped off PE10–PE14 so the WeAct onboard TFT can use SPI4.
 
 IBT-2 / BTS7960: tie **R_EN + L_EN** to EN, logic **VCC = 5 V**, **VS** = coil supply. IS → STM32 ADC (see `IS_RIS_OHM` / `IS_K_RATIO` in `src/main.c`).
+
+### Onboard ST7735 (160×80)
+
+| Signal | Pin |
+|--------|-----|
+| SPI4 SCK | PE12 |
+| SPI4 MOSI | PE14 |
+| CS | PE11 |
+| DC | PE13 |
+| BL (active low) | PE10 |
+
+Shows mode/contour header plus one status row per coil (`M1 ON 180 +0.42A` / `M2 OFF`), refreshed ~10 Hz from live `coils[]` state.
 
 ### ESP32 ↔ STM32 bridge (3.3 V, common GND)
 
@@ -119,7 +134,13 @@ program P1|P2|stop
 
 ```text
 ├── platformio.ini          # STM32H743 env
-├── src/main.c              # Coil PWM, ADC, dual-UART CLI
+├── include/
+│   ├── st7735.h            # Onboard TFT driver API
+│   └── display_ui.h        # Live coil status layout
+├── src/
+│   ├── main.c              # Coil PWM, ADC, dual-UART CLI
+│   ├── st7735.c            # SPI4 + ST7735
+│   └── display_ui.c        # Status screen (~10 Hz)
 ├── esp32_bridge/
 │   ├── platformio.ini      # ESP32-S3 Arduino env
 │   ├── include/config.h    # SoftAP + UART pins

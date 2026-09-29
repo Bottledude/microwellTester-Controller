@@ -18,21 +18,25 @@
  * Open PlatformIO Serial Monitor and type "help", or join the ESP32 SoftAP
  * and open http://192.168.4.1/
  *
- * Wiring (default pin map — change COIL_PINS[] if your harness differs):
+ * Wiring (default pin map — change COIL_HW[] if your harness differs):
  *
  *   Coil  RPWM     LPWM     EN      IS(ADC)
- *   M1    PE9      PE11     PE8     PA0
- *   M2    PE13     PE14     PE10    PA1
+ *   M1    PD14     PD15     PD10    PA0   (TIM4 — frees PE for onboard TFT)
+ *   M2    PE5      PE6      PE4     PA1   (TIM15)
  *   M3    PC6      PC7      PC5     PA2
  *   M4    PC8      PC9      PC4     PA3
  *   M5    PA6      PA7      PB10    PA4
  *   M6    PB0      PB1      PB11    PA5
+ *
+ * Onboard ST7735 (SPI4): PE12 SCK, PE14 MOSI, PE11 CS, PE13 DC, PE10 BL.
  *
  * BTS7960 / IBT-2: tie R_EN+L_EN to EN, VCC=5 V logic, VS = coil supply.
  * IS → MCU ADC through the module sense resistor (see IS_RIS_OHM).
  */
 
 #include "stm32h7xx_hal.h"
+#include "st7735.h"
+#include "display_ui.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,14 +121,14 @@ typedef struct {
 
 /* -------------------- pin / timer map -------------------- */
 static const CoilHw COIL_HW[6] = {
-  /* M1 */ { TIM1, TIM_CHANNEL_1, TIM_CHANNEL_2,
-             { GPIOE, GPIO_PIN_9,  GPIO_AF1_TIM1 },
-             { GPIOE, GPIO_PIN_11, GPIO_AF1_TIM1 },
-             GPIOE, GPIO_PIN_8,  ADC_CHANNEL_16 }, /* IS on PA0 = ADC1_INP16 */
-  /* M2 */ { TIM1, TIM_CHANNEL_3, TIM_CHANNEL_4,
-             { GPIOE, GPIO_PIN_13, GPIO_AF1_TIM1 },
-             { GPIOE, GPIO_PIN_14, GPIO_AF1_TIM1 },
-             GPIOE, GPIO_PIN_10, ADC_CHANNEL_17 }, /* IS on PA1 */
+  /* M1 */ { TIM4, TIM_CHANNEL_3, TIM_CHANNEL_4,
+             { GPIOD, GPIO_PIN_14, GPIO_AF2_TIM4 },
+             { GPIOD, GPIO_PIN_15, GPIO_AF2_TIM4 },
+             GPIOD, GPIO_PIN_10, ADC_CHANNEL_16 }, /* IS on PA0 = ADC1_INP16 */
+  /* M2 */ { TIM15, TIM_CHANNEL_1, TIM_CHANNEL_2,
+             { GPIOE, GPIO_PIN_5,  GPIO_AF4_TIM15 },
+             { GPIOE, GPIO_PIN_6,  GPIO_AF4_TIM15 },
+             GPIOE, GPIO_PIN_4,  ADC_CHANNEL_17 }, /* IS on PA1 */
   /* M3 */ { TIM8, TIM_CHANNEL_1, TIM_CHANNEL_2,
              { GPIOC, GPIO_PIN_6,  GPIO_AF3_TIM8 },
              { GPIOC, GPIO_PIN_7,  GPIO_AF3_TIM8 },
@@ -152,7 +156,7 @@ static const CoilHw COIL_HW[6] = {
 static UART_HandleTypeDef huart1;
 static UART_HandleTypeDef huart3;
 static ADC_HandleTypeDef  hadc1;
-static TIM_HandleTypeDef  htim1, htim3, htim8;
+static TIM_HandleTypeDef  htim3, htim4, htim8, htim15;
 
 static CoilState coils[NUM_COILS];
 static CtrlMode  g_ctrl_mode = CTRL_OPEN;
@@ -180,6 +184,8 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIMx_Init(void);
+static TIM_HandleTypeDef *tim_handle_for(const CoilHw *hw);
+static void Display_PushStatus(void);
 static void Coil_ApplyOutputs(uint8_t idx);
 static void Coil_AllOff(void);
 static float Sense_ReadAmps(uint8_t idx);
@@ -480,20 +486,22 @@ static void tim_start_channel(TIM_HandleTypeDef *htim, uint32_t ch)
 
 static void MX_TIMx_Init(void)
 {
-  __HAL_RCC_TIM1_CLK_ENABLE();
   __HAL_RCC_TIM3_CLK_ENABLE();
+  __HAL_RCC_TIM4_CLK_ENABLE();
   __HAL_RCC_TIM8_CLK_ENABLE();
+  __HAL_RCC_TIM15_CLK_ENABLE();
 
   for (int i = 0; i < NUM_COILS; i++) {
     tim_pwm_gpio(&COIL_HW[i].rpwm);
     tim_pwm_gpio(&COIL_HW[i].lpwm);
   }
 
-  tim_apply_base(&htim1, TIM1);
   tim_apply_base(&htim3, TIM3);
+  tim_apply_base(&htim4, TIM4);
   tim_apply_base(&htim8, TIM8);
+  tim_apply_base(&htim15, TIM15);
 
-  /* Break/dead-time defaults for advanced timers */
+  /* Break/dead-time defaults for advanced timers (TIM8 only now) */
   TIM_BreakDeadTimeConfigTypeDef bd = {0};
   bd.OffStateRunMode = TIM_OSSR_DISABLE;
   bd.OffStateIDLEMode = TIM_OSSI_DISABLE;
@@ -506,14 +514,10 @@ static void MX_TIMx_Init(void)
   bd.Break2Polarity = TIM_BREAK2POLARITY_HIGH;
   bd.Break2Filter = 0;
   bd.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
-  HAL_TIMEx_ConfigBreakDeadTime(&htim1, &bd);
   HAL_TIMEx_ConfigBreakDeadTime(&htim8, &bd);
 
   for (int i = 0; i < NUM_COILS; i++) {
-    TIM_HandleTypeDef *h;
-    if (COIL_HW[i].tim == TIM1) h = &htim1;
-    else if (COIL_HW[i].tim == TIM8) h = &htim8;
-    else h = &htim3;
+    TIM_HandleTypeDef *h = tim_handle_for(&COIL_HW[i]);
     tim_start_channel(h, COIL_HW[i].ch_rpwm);
     tim_start_channel(h, COIL_HW[i].ch_lpwm);
   }
@@ -569,9 +573,24 @@ static void MX_ADC1_Init(void)
 
 static TIM_HandleTypeDef *tim_handle_for(const CoilHw *hw)
 {
-  if (hw->tim == TIM1) return &htim1;
+  if (hw->tim == TIM4) return &htim4;
   if (hw->tim == TIM8) return &htim8;
+  if (hw->tim == TIM15) return &htim15;
   return &htim3;
+}
+
+static void Display_PushStatus(void)
+{
+  DisplayCoilSnap snap[NUM_COILS];
+  for (int i = 0; i < NUM_COILS; i++) {
+    snap[i].enabled = coils[i].enabled;
+    snap[i].magnitude = coils[i].magnitude;
+    snap[i].dir = (coils[i].dir == DIR_FWD) ? 1 : -1;
+    snap[i].i_meas_a = coils[i].i_meas_a;
+    snap[i].i_limit_a = coils[i].i_limit_a;
+  }
+  DisplayUI_Update(g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
+                   g_contour_active, snap, NUM_COILS);
 }
 
 static void tim_set_ccr(TIM_HandleTypeDef *h, uint32_t ch, uint32_t pulse)
@@ -784,8 +803,8 @@ static void CLI_PrintHelp(void)
 
 static void CLI_PrintStatus(void)
 {
-  float fpwm = (float)timer_clock_hz(TIM1) /
-               ((float)(htim1.Init.Prescaler + 1U) * (float)(PWM_ARR + 1U));
+  float fpwm = (float)timer_clock_hz(TIM4) /
+               ((float)(htim4.Init.Prescaler + 1U) * (float)(PWM_ARR + 1U));
   uart_printf("mode=%s  contour=%u  pwm≈%.1f kHz  coils=%d\r\n",
               g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
               (unsigned)g_contour_active, fpwm / 1000.0f, NUM_COILS);
@@ -1077,11 +1096,17 @@ int main(void)
 
   Coil_AllOff();
 
+  /* Onboard ST7735 status UI (SPI4 on PE10–PE14) */
+  ST7735_Init();
+  DisplayUI_Init();
+  Display_PushStatus();
+
   uart_write_to(&cli_ports[0], "\r\n\r\nH743 coil driver ready. Type 'help'.\r\n> ");
   uart_write_to(&cli_ports[1], "BRIDGE_OK\r\n");
   last_loop_ms = HAL_GetTick();
 
   uint32_t led_ms = HAL_GetTick();
+  uint32_t ui_ms = HAL_GetTick();
   while (1) {
     CLI_Poll();
 
@@ -1089,6 +1114,11 @@ int main(void)
     if ((now - last_loop_ms) >= (1000U / CURRENT_LOOP_HZ)) {
       last_loop_ms = now;
       CurrentLoop_Update();
+    }
+
+    if ((now - ui_ms) >= 100U) { /* ~10 Hz TFT refresh */
+      ui_ms = now;
+      Display_PushStatus();
     }
 
     if ((now - led_ms) >= 500U) {
