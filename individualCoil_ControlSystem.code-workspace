@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../HKUST/Soft Magnetic Composite/individualCoil_ControlSystem"
+		},
+		{
+			"name": "Controller_H743_STM32Cube",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
