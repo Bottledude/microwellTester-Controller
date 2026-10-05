@@ -34,9 +34,9 @@ PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H74
 - **Rotating field mode:** open-loop quadrature sine on **M1–M4**
   - Phase A = M1 ∥ M3 @ 0°
   - Phase B = M2 ∥ M4 @ +90° (CW) or −90° (CCW)
-  - Shared **frequency** (0.1–50 Hz) and **amplitude** (0–255)
+  - Shared **frequency** (0.1–50 Hz, default 1 Hz) and **amplitude** (0–255, **default 0** — set `amp` before `rotate on`)
   - ~10 kHz sine update ISR for high waveform resolution
-- Soft current limits (`limit`); while rotating, over-limit reduces live amplitude
+- Soft current limits (`limit`); boot-on all coils at ~2 A; while rotating, over-limit **derates shared live amplitude** (`amp_live` in `status` / `json`)
 - Dual CLI ports: human Serial Monitor + machine ESP32 bridge (`ping` / `json`)
 - Lab web UI tabs: **Field**, **DC coils**, **Logs** (sticky **ALL OFF**)
 - Onboard **0.96" ST7735** status UI
@@ -68,7 +68,7 @@ IBT-2 / BTS7960: tie **R_EN + L_EN** to EN, logic **VCC = 5 V**, **VS** = coil s
 | DC | PE13 |
 | BL (active low) | PE10 |
 
-Shows mode/contour or `ROT fHz Aamp` while rotating, plus one status row per coil (~10 Hz).
+Shows mode/contour or `ROT fHz Aamp` while rotating (**live** amplitude after soft-limit derate), plus one status row per coil (~10 Hz).
 
 ### ESP32 ↔ STM32 bridge (3.3 V, common GND)
 
@@ -107,10 +107,11 @@ WiFi SSID/password and UART pins: `esp32_bridge/include/config.h`.
 1. Join SoftAP **`CoilControl`** / **`coilcontrol`**
 2. Open **http://192.168.4.1/**
 3. Tabs:
-   - **Field** — start/stop rotating field, shared freq/amp, CW/CCW, soft limit
-   - **DC coils** — per-coil constant drive (M1–M4 lock while rotate is on)
+   - **Field** — start/stop rotating field, shared freq/amp, CW/CCW, soft limit. Waveform/status strip follow **live** amp when the field is derated.
+   - **DC coils** — per-coil constant drive. M1–M4 and **contour / program** lock while rotate is on (STOP first).
    - **Logs** — command traffic + raw CLI
-4. Sticky **ALL OFF** always available in the header
+4. Sticky **ALL OFF** in the header (`rotate off` then `off all`)
+5. Link pill is **linked** only after a parsed `json` coil snapshot. Ping-only shows **UART up · status stale**.
 
 ## Serial CLI (STM32)
 
@@ -148,7 +149,9 @@ rotate on
 rotate off
 ```
 
-DC writes to M1–M4 (or `contour` / `program`) automatically stop rotate and return those coils to safe DC control. `off all` also stops rotate.
+DC writes to M1–M4 (or CLI `contour` / `program`) automatically stop rotate and return those coils to safe DC control. `off all` / `program stop` also stop rotate and clear contour. **`rotate off` alone** disables M1–M4 and clears the contour flag.
+
+`status` / `json` report commanded `amp` and soft-clamped `amp_live`. Incomplete CLI lines print usage; unknown motor tokens print an error.
 
 ## Project layout
 
