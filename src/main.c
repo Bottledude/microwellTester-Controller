@@ -3,9 +3,12 @@
  * @brief STM32H743VIT6 (WeAct Mini) coil driver for up to 6× BTS7960 / IBT-2.
  *
  * Each BTS7960 drives one coil (≤ ~2 A). Magnitude is native 0–255 PWM duty
- * at a high carrier (~40 kHz) so the H7 timer clock is used for low ripple.
- * Direction selects RPWM vs LPWM (B-field polarity). BTS7960 IS pins are
- * sampled for current monitoring, soft limiting, and optional closed-loop.
+ * at a high carrier (~40 kHz). Direction selects RPWM vs LPWM (B-field polarity).
+ *
+ * Dual modes:
+ *   DC     — constant magnitude/dir per coil (open- or closed-loop IS)
+ *   Rotate — open-loop quadrature sine on M1–M4 (M1∥M3 @ 0°, M2∥M4 @ ±90°)
+ *            shared freq (0.1–50 Hz) + amp; TIM6 ~10 kHz sine ISR
  *
  * Serial CLI @ 115200 8N1:
  *   USART1 PA9 TX / PA10 RX  — USB-UART Serial Monitor (human, with echo)
@@ -71,6 +74,13 @@ static int str_ieq(const char *a, const char *b)
 #define CLI_LINE_MAX            128
 #define CURRENT_LOOP_HZ         200U   /* sense / closed-loop update rate */
 
+/* Quadrature rotating field (M1∥M3 @ 0°, M2∥M4 @ ±90°) */
+#define NUM_ROTATE_COILS        4
+#define SINE_UPDATE_HZ          10000U
+#define SINE_LUT_SIZE           256
+#define ROTATE_FREQ_MIN_HZ      0.1f
+#define ROTATE_FREQ_MAX_HZ      50.0f
+
 /* BTS7960 sense: Iload ≈ Vis * k_ris / Ris. Datasheet k ≈ 8500. */
 #ifndef IS_RIS_OHM
 #define IS_RIS_OHM              1000.0f
@@ -91,6 +101,11 @@ typedef enum {
   CTRL_OPEN = 0,   /* duty = magnitude */
   CTRL_CLOSED = 1  /* PI on IS toward I_ref(magnitude) */
 } CtrlMode;
+
+typedef enum {
+  ROT_CW = 0,  /* Phase B = +90° (cos) */
+  ROT_CCW = 1  /* Phase B = −90° (−cos) */
+} RotateDir;
 
 typedef struct {
   GPIO_TypeDef *port;
@@ -156,11 +171,56 @@ static const CoilHw COIL_HW[6] = {
 static UART_HandleTypeDef huart1;
 static UART_HandleTypeDef huart3;
 static ADC_HandleTypeDef  hadc1;
-static TIM_HandleTypeDef  htim3, htim4, htim8, htim15;
+static TIM_HandleTypeDef  htim3, htim4, htim8, htim15, htim6;
 
 static CoilState coils[NUM_COILS];
 static CtrlMode  g_ctrl_mode = CTRL_OPEN;
 static uint8_t   g_contour_active;
+
+/* Rotating-field state (open-loop sine on M1–M4) */
+static volatile uint8_t  g_rotate_active;
+static float             g_rotate_freq_hz = 1.0f;
+static uint8_t           g_rotate_amp = 0;
+static volatile uint8_t  g_rotate_amp_live = 0; /* may be soft-clamped */
+static RotateDir         g_rotate_dir = ROT_CW;
+static volatile uint32_t g_phase;
+static volatile uint32_t g_phase_inc;
+
+/* Q15 sine table: sin(2π i / 256) * 32767 */
+static const int16_t SINE_LUT[SINE_LUT_SIZE] = {
+       0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+    6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+   12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+   18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+   23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+   27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+   30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+   32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+   32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+   32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+   30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+   27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+   23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+   18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+   12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+    6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+       0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+   -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+  -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+  -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+  -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+  -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+  -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+  -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+  -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+  -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+  -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+  -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+  -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+  -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+  -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+   -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804
+};
 
 typedef struct {
   USART_TypeDef      *usart;
@@ -184,10 +244,16 @@ static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIMx_Init(void);
+static void MX_TIM6_Init(void);
 static TIM_HandleTypeDef *tim_handle_for(const CoilHw *hw);
 static void Display_PushStatus(void);
 static void Coil_ApplyOutputs(uint8_t idx);
+static void Coil_ApplySignedDuty(uint8_t idx, int16_t signed_duty);
 static void Coil_AllOff(void);
+static void Rotate_RecalcPhaseInc(void);
+static void Rotate_Stop(void);
+static void Rotate_Start(void);
+static void Rotate_StopIfDcConflict(uint8_t idx);
 static float Sense_ReadAmps(uint8_t idx);
 static void CurrentLoop_Update(void);
 static void CLI_PollPort(CliPort *port);
@@ -523,6 +589,34 @@ static void MX_TIMx_Init(void)
   }
 }
 
+/* TIM6 @ SINE_UPDATE_HZ — open-loop sine sample clock for rotating field */
+static void MX_TIM6_Init(void)
+{
+  __HAL_RCC_TIM6_CLK_ENABLE();
+
+  uint32_t tclk = timer_clock_hz(TIM6); /* 240 MHz with APB1÷2 */
+  uint32_t ticks = tclk / SINE_UPDATE_HZ;
+  uint32_t psc = 1U;
+  uint32_t arr = ticks;
+  if (arr > 0xFFFFU) {
+    psc = (ticks / 0x10000U) + 1U;
+    arr = ticks / psc;
+  }
+  if (arr < 1U) arr = 1U;
+
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = psc - 1U;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = arr - 1U;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK) {
+    Error_Handler();
+  }
+
+  HAL_NVIC_SetPriority(TIM6_DAC_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(TIM6_DAC_IRQn);
+}
+
 static void MX_ADC1_Init(void)
 {
   RCC_PeriphCLKInitTypeDef per = {0};
@@ -584,13 +678,19 @@ static void Display_PushStatus(void)
   DisplayCoilSnap snap[NUM_COILS];
   for (int i = 0; i < NUM_COILS; i++) {
     snap[i].enabled = coils[i].enabled;
-    snap[i].magnitude = coils[i].magnitude;
+    snap[i].magnitude = g_rotate_active && i < NUM_ROTATE_COILS
+                             ? g_rotate_amp_live
+                             : coils[i].magnitude;
     snap[i].dir = (coils[i].dir == DIR_FWD) ? 1 : -1;
     snap[i].i_meas_a = coils[i].i_meas_a;
     snap[i].i_limit_a = coils[i].i_limit_a;
   }
   DisplayUI_Update(g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
-                   g_contour_active, snap, NUM_COILS);
+                   g_contour_active,
+                   g_rotate_active,
+                   g_rotate_freq_hz,
+                   g_rotate_amp_live,
+                   snap, NUM_COILS);
 }
 
 static void tim_set_ccr(TIM_HandleTypeDef *h, uint32_t ch, uint32_t pulse)
@@ -608,6 +708,9 @@ static void tim_set_ccr(TIM_HandleTypeDef *h, uint32_t ch, uint32_t pulse)
 static void Coil_ApplyOutputs(uint8_t idx)
 {
   if (idx >= NUM_COILS) return;
+  /* Rotate ISR owns M1–M4 PWM while active */
+  if (g_rotate_active && idx < NUM_ROTATE_COILS) return;
+
   const CoilHw *hw = &COIL_HW[idx];
   CoilState *st = &coils[idx];
   TIM_HandleTypeDef *h = tim_handle_for(hw);
@@ -634,8 +737,100 @@ static void Coil_ApplyOutputs(uint8_t idx)
   }
 }
 
+/* Bipolar H-bridge duty from signed sample (−255..+255). ISR-safe. */
+static void Coil_ApplySignedDuty(uint8_t idx, int16_t signed_duty)
+{
+  if (idx >= NUM_COILS) return;
+  const CoilHw *hw = &COIL_HW[idx];
+  TIM_HandleTypeDef *h = tim_handle_for(hw);
+  uint16_t mag;
+
+  if (signed_duty > (int16_t)PWM_ARR) signed_duty = (int16_t)PWM_ARR;
+  if (signed_duty < -(int16_t)PWM_ARR) signed_duty = -(int16_t)PWM_ARR;
+
+  if (signed_duty >= 0) {
+    mag = (uint16_t)signed_duty;
+    if (mag == 0) {
+      tim_set_ccr(h, hw->ch_rpwm, 0);
+      tim_set_ccr(h, hw->ch_lpwm, 0);
+      HAL_GPIO_WritePin(hw->en_port, hw->en_pin, GPIO_PIN_RESET);
+    } else {
+      HAL_GPIO_WritePin(hw->en_port, hw->en_pin, GPIO_PIN_SET);
+      tim_set_ccr(h, hw->ch_rpwm, mag);
+      tim_set_ccr(h, hw->ch_lpwm, 0);
+    }
+  } else {
+    mag = (uint16_t)(-signed_duty);
+    HAL_GPIO_WritePin(hw->en_port, hw->en_pin, GPIO_PIN_SET);
+    tim_set_ccr(h, hw->ch_rpwm, 0);
+    tim_set_ccr(h, hw->ch_lpwm, mag);
+  }
+
+  coils[idx].duty_applied = mag;
+  coils[idx].dir = (signed_duty >= 0) ? DIR_FWD : DIR_REV;
+}
+
+static void Rotate_RecalcPhaseInc(void)
+{
+  float f = g_rotate_freq_hz;
+  if (f < ROTATE_FREQ_MIN_HZ) f = ROTATE_FREQ_MIN_HZ;
+  if (f > ROTATE_FREQ_MAX_HZ) f = ROTATE_FREQ_MAX_HZ;
+  g_rotate_freq_hz = f;
+  /* Advance 2^32 * f / SINE_UPDATE_HZ per tick (full turns in Q32). */
+  double inc = ((double)f / (double)SINE_UPDATE_HZ) * 4294967296.0;
+  if (inc < 1.0) inc = 1.0;
+  if (inc > 4294967295.0) inc = 4294967295.0;
+  g_phase_inc = (uint32_t)inc;
+}
+
+static void Rotate_Stop(void)
+{
+  g_rotate_active = 0;
+  g_contour_active = 0; /* idle header/json must not keep a stale contour flag */
+  HAL_TIM_Base_Stop_IT(&htim6);
+  g_rotate_amp_live = g_rotate_amp;
+
+  int n = (NUM_COILS < NUM_ROTATE_COILS) ? NUM_COILS : NUM_ROTATE_COILS;
+  for (int i = 0; i < n; i++) {
+    coils[i].enabled = 0;
+    coils[i].duty_applied = 0;
+    coils[i].pi_integral = 0;
+    Coil_ApplyOutputs((uint8_t)i);
+  }
+}
+
+static void Rotate_Start(void)
+{
+#if (NUM_COILS < NUM_ROTATE_COILS)
+  uart_write("rotate needs NUM_COILS>=4\r\n");
+  return;
+#else
+  g_contour_active = 0;
+  Rotate_RecalcPhaseInc();
+  g_phase = 0;
+  g_rotate_amp_live = g_rotate_amp;
+
+  for (int i = 0; i < NUM_ROTATE_COILS; i++) {
+    coils[i].enabled = 1;
+    coils[i].pi_integral = 0;
+    coils[i].magnitude = g_rotate_amp;
+  }
+
+  g_rotate_active = 1;
+  HAL_TIM_Base_Start_IT(&htim6);
+#endif
+}
+
+static void Rotate_StopIfDcConflict(uint8_t idx)
+{
+  if (g_rotate_active && idx < NUM_ROTATE_COILS) {
+    Rotate_Stop();
+  }
+}
+
 static void Coil_AllOff(void)
 {
+  Rotate_Stop();
   g_contour_active = 0;
   for (int i = 0; i < NUM_COILS; i++) {
     coils[i].enabled = 0;
@@ -648,6 +843,7 @@ static void Coil_AllOff(void)
 static void Coil_SetEnabled(uint8_t idx, uint8_t on)
 {
   if (idx >= NUM_COILS) return;
+  Rotate_StopIfDcConflict(idx);
   coils[idx].enabled = on ? 1 : 0;
   if (!on) {
     coils[idx].duty_applied = 0;
@@ -659,6 +855,7 @@ static void Coil_SetEnabled(uint8_t idx, uint8_t on)
 static void Coil_SetMagnitude(uint8_t idx, uint8_t mag)
 {
   if (idx >= NUM_COILS) return;
+  Rotate_StopIfDcConflict(idx);
   coils[idx].magnitude = mag;
   if (g_ctrl_mode == CTRL_OPEN) {
     coils[idx].duty_applied = mag;
@@ -669,6 +866,7 @@ static void Coil_SetMagnitude(uint8_t idx, uint8_t mag)
 static void Coil_SetDir(uint8_t idx, CoilDir d)
 {
   if (idx >= NUM_COILS) return;
+  Rotate_StopIfDcConflict(idx);
   coils[idx].dir = d;
   Coil_ApplyOutputs(idx);
 }
@@ -708,6 +906,15 @@ static void CurrentLoop_Update(void)
 {
   for (uint8_t i = 0; i < NUM_COILS; i++) {
     CoilState *st = &coils[i];
+
+    /* Rotating field owns M1–M4; sense for soft amp clamp / display only */
+    if (g_rotate_active && i < NUM_ROTATE_COILS) {
+      float i_meas = Sense_ReadAmps(i);
+      if (st->i_limit_a > 0.0f && i_meas > st->i_limit_a) {
+        if (g_rotate_amp_live > 0) g_rotate_amp_live--;
+      }
+      continue;
+    }
 
     if (!st->enabled) {
       st->duty_applied = 0;
@@ -753,6 +960,19 @@ static void CurrentLoop_Update(void)
     st->duty_applied = (uint16_t)(u + 0.5f);
     Coil_ApplyOutputs(i);
   }
+
+  /* Recover soft-clamped rotate amp toward commanded amp when under limit */
+  if (g_rotate_active && g_rotate_amp_live < g_rotate_amp) {
+    uint8_t under = 1;
+    for (uint8_t i = 0; i < NUM_ROTATE_COILS && i < NUM_COILS; i++) {
+      if (coils[i].i_limit_a > 0.0f &&
+          coils[i].i_meas_a > coils[i].i_limit_a * 0.9f) {
+        under = 0;
+        break;
+      }
+    }
+    if (under) g_rotate_amp_live++;
+  }
 }
 
 /* -------------------- CLI -------------------- */
@@ -783,20 +1003,28 @@ static void CLI_PrintHelp(void)
     "help                         show this help\r\n"
     "status                       show coil states + currents\r\n"
     "sense                        sample IS currents once\r\n"
-    "on <M1..M6> [..]             enable coil(s)\r\n"
+    "on <M1..M6> [..]             enable coil(s) [DC]\r\n"
     "off <M1..M6|all> [..]        disable coil(s)\r\n"
-    "set <M#|all> <0..255>        magnitude (duty / Iref scale)\r\n"
-    "dir <M#|all> <+|->           B-field / current direction\r\n"
-    "drive <M#> <0..255> <+|->    set mag+dir and enable\r\n"
+    "set <M#|all> <0..255>        magnitude (duty / Iref scale) [DC]\r\n"
+    "dir <M#|all> <+|->           B-field / current direction [DC]\r\n"
+    "drive <M#> <0..255> <+|->    set mag+dir and enable [DC]\r\n"
     "limit <M#|all> <0..255>      soft current limit (255=~2A, 0=off)\r\n"
-    "mode open|closed             open-loop duty vs IS closed-loop\r\n"
-    "contour on|off               enable M1..M4 together (contour)\r\n"
+    "mode open|closed             open-loop duty vs IS closed-loop [DC]\r\n"
+    "rotate on|off                quadrature sine on M1..M4 (set amp first)\r\n"
+    "freq <Hz>                    rotate freq 0.1..50 Hz\r\n"
+    "amp <0..255>                 shared sine peak amplitude (default 0)\r\n"
+    "rot_dir cw|ccw               Phase B lead (+90) or lag (-90)\r\n"
+    "contour on|off               enable M1..M4 together (DC contour)\r\n"
     "program P1|P2|stop           preset patterns\r\n"
     "  P1 = M1..M4 ON (keep mag/dir)\r\n"
     "  P2 = M1..M4 ON @128 FWD\r\n"
     "  stop = all off\r\n"
     "json                         machine-readable status (ESP32 / UI)\r\n"
     "ping                         bridge heartbeat (replies PONG)\r\n"
+    "\r\n"
+    "Rotate: M1||M3 = Phase A (0 deg), M2||M4 = Phase B (+/-90 deg)\r\n"
+    "DC writes to M1..M4 auto-stop rotate. Limits while rotating derate shared amp.\r\n"
+    "Boot soft-limits all coils to ~2 A (limit … 0 disables).\r\n"
     "\r\n"
   );
 }
@@ -805,9 +1033,16 @@ static void CLI_PrintStatus(void)
 {
   float fpwm = (float)timer_clock_hz(TIM4) /
                ((float)(htim4.Init.Prescaler + 1U) * (float)(PWM_ARR + 1U));
-  uart_printf("mode=%s  contour=%u  pwm≈%.1f kHz  coils=%d\r\n",
+  uart_printf("mode=%s  contour=%u  rotate=%u  freq=%.2f Hz  amp=%u  amp_live=%u  rot_dir=%s\r\n",
               g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
-              (unsigned)g_contour_active, fpwm / 1000.0f, NUM_COILS);
+              (unsigned)g_contour_active,
+              (unsigned)g_rotate_active,
+              (double)g_rotate_freq_hz,
+              (unsigned)g_rotate_amp,
+              (unsigned)g_rotate_amp_live,
+              g_rotate_dir == ROT_CW ? "cw" : "ccw");
+  uart_printf("pwm≈%.1f kHz  sine_isr=%u Hz  coils=%d\r\n",
+              fpwm / 1000.0f, (unsigned)SINE_UPDATE_HZ, NUM_COILS);
   for (int i = 0; i < NUM_COILS; i++) {
     CoilState *s = &coils[i];
     uart_printf("M%d en=%u mag=%3u dir=%s duty=%3u I=%.3fA lim=%.2fA\r\n",
@@ -844,11 +1079,18 @@ static void CLI_HandleLine(char *line)
     for (int i = 0; i < NUM_COILS; i++) {
       amps[i] = Sense_ReadAmps((uint8_t)i);
     }
-    static char js[768];
+    static char js[896];
     int n = snprintf(js, sizeof(js),
-                     "{\"ok\":1,\"mode\":\"%s\",\"contour\":%u,\"n\":%d,\"coils\":[",
+                     "{\"ok\":1,\"mode\":\"%s\",\"contour\":%u,\"rotate\":%u,"
+                     "\"freq\":%.2f,\"amp\":%u,\"amp_live\":%u,\"rot_dir\":\"%s\",\"n\":%d,\"coils\":[",
                      g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
-                     (unsigned)g_contour_active, NUM_COILS);
+                     (unsigned)g_contour_active,
+                     (unsigned)g_rotate_active,
+                     (double)g_rotate_freq_hz,
+                     (unsigned)g_rotate_amp,
+                     (unsigned)g_rotate_amp_live,
+                     g_rotate_dir == ROT_CW ? "cw" : "ccw",
+                     NUM_COILS);
     for (int i = 0; i < NUM_COILS && n > 0 && n < (int)sizeof(js) - 120; i++) {
       CoilState *s = &coils[i];
       n += snprintf(js + n, sizeof(js) - (size_t)n,
@@ -878,7 +1120,8 @@ static void CLI_HandleLine(char *line)
     }
     return;
   }
-  if (!strcmp(cmd, "mode") && argc >= 2) {
+  if (!strcmp(cmd, "mode")) {
+    if (argc < 2) { uart_write("usage: mode open|closed\r\n"); return; }
     if (str_ieq(argv[1], "open")) {
       g_ctrl_mode = CTRL_OPEN;
       uart_write("mode=open\r\n");
@@ -902,6 +1145,8 @@ static void CLI_HandleLine(char *line)
       if (parse_motor_token(argv[a], &idx) == 0) {
         Coil_SetEnabled(idx, 0);
         uart_printf("M%d off\r\n", idx + 1);
+      } else {
+        uart_printf("unknown motor '%s'\r\n", argv[a]);
       }
     }
     return;
@@ -915,11 +1160,14 @@ static void CLI_HandleLine(char *line)
         Coil_SetEnabled(idx, 1);
         uart_printf("M%d on mag=%u dir=%s\r\n", idx + 1, coils[idx].magnitude,
                     coils[idx].dir == DIR_FWD ? "+" : "-");
+      } else {
+        uart_printf("unknown motor '%s'\r\n", argv[a]);
       }
     }
     return;
   }
-  if (!strcmp(cmd, "set") && argc >= 3) {
+  if (!strcmp(cmd, "set")) {
+    if (argc < 3) { uart_write("usage: set <M#|all> <0..255>\r\n"); return; }
     int mag = atoi(argv[2]);
     if (mag < 0) mag = 0;
     if (mag > 255) mag = 255;
@@ -931,11 +1179,14 @@ static void CLI_HandleLine(char *line)
       if (parse_motor_token(argv[1], &idx) == 0) {
         Coil_SetMagnitude(idx, (uint8_t)mag);
         uart_printf("M%d magnitude=%d\r\n", idx + 1, mag);
+      } else {
+        uart_printf("unknown motor '%s'\r\n", argv[1]);
       }
     }
     return;
   }
-  if (!strcmp(cmd, "dir") && argc >= 3) {
+  if (!strcmp(cmd, "dir")) {
+    if (argc < 3) { uart_write("usage: dir <M#|all> <+|->\r\n"); return; }
     CoilDir d = (argv[2][0] == '-' || argv[2][0] == 'r' || argv[2][0] == 'R')
                     ? DIR_REV : DIR_FWD;
     if (str_ieq(argv[1], "all")) {
@@ -946,14 +1197,17 @@ static void CLI_HandleLine(char *line)
       if (parse_motor_token(argv[1], &idx) == 0) {
         Coil_SetDir(idx, d);
         uart_printf("M%d dir=%s\r\n", idx + 1, d == DIR_FWD ? "+" : "-");
+      } else {
+        uart_printf("unknown motor '%s'\r\n", argv[1]);
       }
     }
     return;
   }
-  if (!strcmp(cmd, "drive") && argc >= 4) {
+  if (!strcmp(cmd, "drive")) {
+    if (argc < 4) { uart_write("usage: drive <M#> <0..255> <+|->\r\n"); return; }
     uint8_t idx;
     if (parse_motor_token(argv[1], &idx) != 0) {
-      uart_write("usage: drive <M#> <0..255> <+|->\r\n");
+      uart_printf("unknown motor '%s'\r\n", argv[1]);
       return;
     }
     int mag = atoi(argv[2]);
@@ -966,7 +1220,8 @@ static void CLI_HandleLine(char *line)
     uart_printf("M%d drive mag=%d dir=%s\r\n", idx + 1, mag, d == DIR_FWD ? "+" : "-");
     return;
   }
-  if (!strcmp(cmd, "limit") && argc >= 3) {
+  if (!strcmp(cmd, "limit")) {
+    if (argc < 3) { uart_write("usage: limit <M#|all> <0..255>\r\n"); return; }
     int lim = atoi(argv[2]);
     if (lim < 0) lim = 0;
     if (lim > 255) lim = 255;
@@ -979,11 +1234,15 @@ static void CLI_HandleLine(char *line)
       if (parse_motor_token(argv[1], &idx) == 0) {
         coils[idx].i_limit_a = amps;
         uart_printf("M%d limit=%.3f A\r\n", idx + 1, amps);
+      } else {
+        uart_printf("unknown motor '%s'\r\n", argv[1]);
       }
     }
     return;
   }
-  if (!strcmp(cmd, "contour") && argc >= 2) {
+  if (!strcmp(cmd, "contour")) {
+    if (argc < 2) { uart_write("usage: contour on|off\r\n"); return; }
+    Rotate_Stop();
     if (str_ieq(argv[1], "on")) {
       g_contour_active = 1;
       int n = (NUM_COILS < 4) ? NUM_COILS : 4;
@@ -992,20 +1251,24 @@ static void CLI_HandleLine(char *line)
         Coil_SetEnabled((uint8_t)i, 1);
       }
       uart_write("contour ON (M1..M4)\r\n");
-    } else {
+    } else if (str_ieq(argv[1], "off")) {
       g_contour_active = 0;
       int n = (NUM_COILS < 4) ? NUM_COILS : 4;
       for (int i = 0; i < n; i++) Coil_SetEnabled((uint8_t)i, 0);
       uart_write("contour OFF\r\n");
+    } else {
+      uart_write("usage: contour on|off\r\n");
     }
     return;
   }
-  if (!strcmp(cmd, "program") && argc >= 2) {
+  if (!strcmp(cmd, "program")) {
+    if (argc < 2) { uart_write("usage: program P1|P2|stop\r\n"); return; }
     if (str_ieq(argv[1], "stop") || str_ieq(argv[1], "off")) {
       Coil_AllOff();
       uart_write("program stop\r\n");
       return;
     }
+    Rotate_Stop();
     if (str_ieq(argv[1], "P1") || str_ieq(argv[1], "p1")) {
       int n = (NUM_COILS < 4) ? NUM_COILS : 4;
       g_contour_active = 1;
@@ -1028,6 +1291,57 @@ static void CLI_HandleLine(char *line)
       return;
     }
     uart_write("usage: program P1|P2|stop\r\n");
+    return;
+  }
+  if (!strcmp(cmd, "rotate")) {
+    if (argc < 2) { uart_write("usage: rotate on|off\r\n"); return; }
+    if (str_ieq(argv[1], "on")) {
+      Rotate_Start();
+      uart_printf("rotate ON freq=%.2f amp=%u dir=%s\r\n",
+                  (double)g_rotate_freq_hz, (unsigned)g_rotate_amp,
+                  g_rotate_dir == ROT_CW ? "cw" : "ccw");
+    } else if (str_ieq(argv[1], "off")) {
+      Rotate_Stop();
+      uart_write("rotate OFF\r\n");
+    } else {
+      uart_write("usage: rotate on|off\r\n");
+    }
+    return;
+  }
+  if (!strcmp(cmd, "freq")) {
+    if (argc < 2) { uart_write("usage: freq <Hz>\r\n"); return; }
+    float f = (float)atof(argv[1]);
+    if (f < ROTATE_FREQ_MIN_HZ) f = ROTATE_FREQ_MIN_HZ;
+    if (f > ROTATE_FREQ_MAX_HZ) f = ROTATE_FREQ_MAX_HZ;
+    g_rotate_freq_hz = f;
+    Rotate_RecalcPhaseInc();
+    uart_printf("freq=%.2f Hz\r\n", (double)g_rotate_freq_hz);
+    return;
+  }
+  if (!strcmp(cmd, "amp")) {
+    if (argc < 2) { uart_write("usage: amp <0..255>\r\n"); return; }
+    int a = atoi(argv[1]);
+    if (a < 0) a = 0;
+    if (a > 255) a = 255;
+    g_rotate_amp = (uint8_t)a;
+    g_rotate_amp_live = g_rotate_amp;
+    for (int i = 0; i < NUM_ROTATE_COILS && i < NUM_COILS; i++) {
+      coils[i].magnitude = g_rotate_amp;
+    }
+    uart_printf("amp=%u\r\n", (unsigned)g_rotate_amp);
+    return;
+  }
+  if (!strcmp(cmd, "rot_dir") || !strcmp(cmd, "rotdir")) {
+    if (argc < 2) { uart_write("usage: rot_dir cw|ccw\r\n"); return; }
+    if (str_ieq(argv[1], "cw") || str_ieq(argv[1], "+") || str_ieq(argv[1], "fwd")) {
+      g_rotate_dir = ROT_CW;
+      uart_write("rot_dir=cw\r\n");
+    } else if (str_ieq(argv[1], "ccw") || str_ieq(argv[1], "-") || str_ieq(argv[1], "rev")) {
+      g_rotate_dir = ROT_CCW;
+      uart_write("rot_dir=ccw\r\n");
+    } else {
+      uart_write("usage: rot_dir cw|ccw\r\n");
+    }
     return;
   }
 
@@ -1076,12 +1390,15 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
   MX_TIMx_Init();
+  MX_TIM6_Init();
   MX_ADC1_Init();
 
   memset(coils, 0, sizeof(coils));
   for (int i = 0; i < NUM_COILS; i++) {
     coils[i].i_limit_a = I_FULLSCALE_A; /* default soft cap ≈ 2 A */
   }
+  Rotate_RecalcPhaseInc();
+  g_rotate_amp_live = g_rotate_amp;
 
   /* Port 0: Serial Monitor. Port 1: ESP32 bridge (no echo). */
   cli_ports[0].usart = USART1;
@@ -1138,6 +1455,32 @@ void Error_Handler(void)
 void SysTick_Handler(void)
 {
   HAL_IncTick();
+}
+
+/* ~10 kHz sine update for M1–M4 rotating field */
+void TIM6_DAC_IRQHandler(void)
+{
+  HAL_TIM_IRQHandler(&htim6);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance != TIM6 || !g_rotate_active) return;
+
+  g_phase += g_phase_inc;
+  uint8_t si = (uint8_t)(g_phase >> 24); /* top 8 bits → 256-entry LUT */
+  int32_t s = SINE_LUT[si];
+  int32_t c = SINE_LUT[(uint8_t)(si + 64U)]; /* +90° */
+  if (g_rotate_dir == ROT_CCW) c = -c;
+
+  uint8_t amp = g_rotate_amp_live;
+  int16_t d_a = (int16_t)((s * (int32_t)amp) >> 15);
+  int16_t d_b = (int16_t)((c * (int32_t)amp) >> 15);
+
+  Coil_ApplySignedDuty(0, d_a); /* M1 Phase A */
+  Coil_ApplySignedDuty(1, d_b); /* M2 Phase B */
+  Coil_ApplySignedDuty(2, d_a); /* M3 Phase A */
+  Coil_ApplySignedDuty(3, d_b); /* M4 Phase B */
 }
 
 void NMI_Handler(void) {}

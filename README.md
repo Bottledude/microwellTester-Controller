@@ -1,13 +1,13 @@
 # Soft Magnetic Composite Controller
 
-PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H743VIT6** and up to six **BTS7960 / IBT-2** half-bridge drivers. An optional **ESP32-S3 N16R8** provides a WiFi SoftAP and browser UI while the STM32 Serial Monitor CLI remains available in parallel.
+PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H743VIT6** and up to six **BTS7960 / IBT-2** half-bridge drivers. An optional **ESP32-S3 N16R8** provides a WiFi SoftAP and lab-oriented browser UI while the STM32 Serial Monitor CLI remains available in parallel.
 
 **Repo:** https://github.com/Bottledude/softMagneticComposite-Controller
 
 ## Architecture
 
 ```text
-Browser  ──WiFi SoftAP──►  ESP32-S3          Serial Monitor (USB-UART)
+    Browser  ──WiFi SoftAP──►  ESP32-S3          Serial Monitor (USB-UART)
                               │                      │
                          UART 115200            USART1 115200
                          GPIO17/18 ↔ PD8/PD9     PA9/PA10
@@ -29,13 +29,17 @@ Browser  ──WiFi SoftAP──►  ESP32-S3          Serial Monitor (USB-UART)
 ## Features
 
 - Up to **6 coils**, each on its own BTS7960 (RPWM / LPWM / EN / IS)
-- **~40 kHz PWM**, duty **0–255** (maps to magnitude / I_ref scale; 255 ≈ 2 A)
-- **Direction** (+/−) selects RPWM vs LPWM for B-field polarity
-- **Open-loop** duty or **closed-loop** current via BTS7960 IS → ADC
-- Soft current limits (`limit`)
+- **~40 kHz PWM carrier**, duty **0–255**
+- **DC mode:** constant magnitude + direction per coil (open- or closed-loop IS)
+- **Rotating field mode:** open-loop quadrature sine on **M1–M4**
+  - Phase A = M1 ∥ M3 @ 0°
+  - Phase B = M2 ∥ M4 @ +90° (CW) or −90° (CCW)
+  - Shared **frequency** (0.1–50 Hz) and **amplitude** (0–255)
+  - ~10 kHz sine update ISR for high waveform resolution
+- Soft current limits (`limit`); while rotating, over-limit reduces live amplitude
 - Dual CLI ports: human Serial Monitor + machine ESP32 bridge (`ping` / `json`)
-- Web UI tabs: **Configuration**, **Motor drivers**, **Logs**
-- Onboard **0.96" ST7735** status UI (per-coil ON/OFF, mag, dir, current)
+- Lab web UI tabs: **Field**, **DC coils**, **Logs** (sticky **ALL OFF**)
+- Onboard **0.96" ST7735** status UI
 
 ## Hardware
 
@@ -64,7 +68,7 @@ IBT-2 / BTS7960: tie **R_EN + L_EN** to EN, logic **VCC = 5 V**, **VS** = coil s
 | DC | PE13 |
 | BL (active low) | PE10 |
 
-Shows mode/contour header plus one status row per coil (`M1 ON 180 +0.42A` / `M2 OFF`), refreshed ~10 Hz from live `coils[]` state.
+Shows mode/contour or `ROT fHz Aamp` while rotating, plus one status row per coil (~10 Hz).
 
 ### ESP32 ↔ STM32 bridge (3.3 V, common GND)
 
@@ -102,12 +106,11 @@ WiFi SSID/password and UART pins: `esp32_bridge/include/config.h`.
 
 1. Join SoftAP **`CoilControl`** / **`coilcontrol`**
 2. Open **http://192.168.4.1/**
-3. Use tabs:
-   - **Configuration** — mode, current limits, default magnitude, programs
-   - **Motor drivers** — per-coil enable / magnitude / direction
-   - **Logs** — command traffic + raw CLI box
-
-Link pill uses a `ping` → `PONG` heartbeat; coil readouts come from the STM32 `json` status line.
+3. Tabs:
+   - **Field** — start/stop rotating field, shared freq/amp, CW/CCW, soft limit
+   - **DC coils** — per-coil constant drive (M1–M4 lock while rotate is on)
+   - **Logs** — command traffic + raw CLI
+4. Sticky **ALL OFF** always available in the header
 
 ## Serial CLI (STM32)
 
@@ -128,7 +131,24 @@ drive M2 200 -
 limit all 255
 contour on|off
 program P1|P2|stop
+rotate on|off
+freq 5
+amp 180
+rot_dir cw|ccw
 ```
+
+### Rotating field
+
+```text
+freq 2.5
+amp 160
+rot_dir cw
+rotate on
+...
+rotate off
+```
+
+DC writes to M1–M4 (or `contour` / `program`) automatically stop rotate and return those coils to safe DC control. `off all` also stops rotate.
 
 ## Project layout
 
@@ -138,13 +158,13 @@ program P1|P2|stop
 │   ├── st7735.h            # Onboard TFT driver API
 │   └── display_ui.h        # Live coil status layout
 ├── src/
-│   ├── main.c              # Coil PWM, ADC, dual-UART CLI
+│   ├── main.c              # Coil PWM, sine ISR, ADC, dual-UART CLI
 │   ├── st7735.c            # SPI4 + ST7735
 │   └── display_ui.c        # Status screen (~10 Hz)
 ├── esp32_bridge/
 │   ├── platformio.ini      # ESP32-S3 Arduino env
 │   ├── include/config.h    # SoftAP + UART pins
-│   ├── include/www_page.h  # Embedded web UI
+│   ├── include/www_page.h  # Embedded lab web UI
 │   └── src/main.cpp        # SoftAP, HTTP API, UART bridge
 └── CoilController.code-workspace
 ```
