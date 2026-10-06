@@ -231,6 +231,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
 <div class="status-strip" id="statusStrip">
   <span>rotate <b id="stRot">off</b></span>
+  <span>axis <b id="stAxis">z</b></span>
   <span>freq <b id="stFreq">1.00</b> Hz</span>
   <span>amp <b id="stAmp">0</b></span>
   <span>dir <b id="stDir">cw</b></span>
@@ -262,7 +263,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
     </div>
     <h2 class="section-title">Rotating magnetic field</h2>
-    <p class="section-help">Open-loop quadrature sine on M1–M4. Phase A = M1∥M3 @ 0°. Phase B = M2∥M4 @ ±90°. Shared amplitude and frequency.</p>
+    <p class="section-help">Four coils at 90°, each tilted ~45°. <b>Z</b>: in-plane quadrature on all four. <b>X</b>: M2∥M4 same current direction so horizontal fields cancel and vertical fields add — vary that current for torque about X (M1–M3 axis). Amp ramps on start/stop/dir/axis (~1.3 s). ALL OFF still cuts immediately.</p>
     <div class="cfg-grid">
       <div class="card">
         <h2>Run control</h2>
@@ -270,18 +271,27 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
           <button type="button" class="primary large" id="btnRotOn" onclick="setRotate(true)">START</button>
           <button type="button" class="danger large" id="btnRotOff" onclick="setRotate(false)">STOP</button>
         </div>
-        <div class="kv" style="margin-top:12px">State: <b id="cfgRotLabel">off</b> · open-loop sine</div>
+        <div class="kv" style="margin-top:12px">State: <b id="cfgRotLabel">off</b> · axis <b id="cfgAxisLabel">Z</b></div>
         <div class="phase-map">
           <div class="phase-box">
-            <div class="t">Phase A · 0°</div>
-            <div class="v">M1 ∥ M3</div>
+            <div class="t" id="phaseATitle">M1 ∥ M3 · X</div>
+            <div class="v" id="phaseARole">Z: Phase A @ 0°</div>
             <div class="kv" style="margin-top:6px">I ≈ <b id="phaseAI">0.000</b> A</div>
           </div>
           <div class="phase-box">
-            <div class="t">Phase B · ±90°</div>
-            <div class="v">M2 ∥ M4</div>
+            <div class="t" id="phaseBTitle">M2 ∥ M4 · Y</div>
+            <div class="v" id="phaseBRole">Z: Phase B @ ±90°</div>
             <div class="kv" style="margin-top:6px">I ≈ <b id="phaseBI">0.000</b> A</div>
           </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Rotation axis</h2>
+        <p class="section-help">Z = spin in the coil plane. X = M2 and M4 in-phase (net vertical field).</p>
+        <div class="seg">
+          <button type="button" id="axisZBtn" class="active" onclick="setAxis('z')">Z (in-plane)</button>
+          <button type="button" id="axisXBtn" onclick="setAxis('x')">X (M2∥M4)</button>
         </div>
       </div>
 
@@ -302,7 +312,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Amplitude</h2>
-        <p class="section-help">Shared peak duty 0–255 for all four coils.</p>
+        <p class="section-help">Shared peak duty 0–255. Z uses all four coils; X uses M2∥M4 only.</p>
         <div class="field">
           <label for="ampVal">Amplitude <b id="ampLabel">0</b></label>
           <input id="ampVal" type="number" min="0" max="255" step="1" value="0"
@@ -316,7 +326,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Rotation direction</h2>
-        <p class="section-help">CW: Phase B = +90°. CCW: Phase B = −90°.</p>
+        <p class="section-help">Z: CW = Phase B +90°, CCW = −90°. X: inverts the common M2∥M4 sine.</p>
         <div class="seg">
           <button type="button" id="dirCwBtn" class="active" onclick="setRotDir('cw')">CW</button>
           <button type="button" id="dirCcwBtn" onclick="setRotDir('ccw')">CCW</button>
@@ -350,8 +360,8 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
   <section id="tab-dc" class="tab-panel">
     <h2 class="section-title">DC coil drivers</h2>
-    <p class="section-help">Constant magnitude / direction (not sine). Use for manual setup. M1–M4 lock while rotating field is active.</p>
-    <div class="banner show" id="dcLockBanner" style="display:none;margin:0 0 12px">Rotating field active — stop Field to use DC on M1–M4. M5/M6 remain available.</div>
+    <p class="section-help">Constant magnitude / direction (not sine). All four coils lock while a rotating field is active.</p>
+    <div class="banner show" id="dcLockBanner" style="display:none;margin:0 0 12px">Rotating field active — stop Field to use DC on M1–M4.</div>
     <div class="toolbar" id="dcPresetToolbar">
       <button type="button" id="btnContourOn" onclick="sendContour(true)">Contour ON (M1–M4)</button>
       <button type="button" id="btnContourOff" onclick="sendContour(false)">Contour OFF</button>
@@ -386,9 +396,10 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 </main>
 
 <script>
-const N = 6;
+const N = 4;
 let state = {
-  mode: 'open', contour: 0, rotate: 0, freq: 1.0, amp: 0, amp_live: 0, rot_dir: 'cw', coils: []
+  mode: 'open', contour: 0, rotate: 0, axis: 'z', axis_live: 'z',
+  freq: 1.0, amp: 0, amp_live: 0, rot_dir: 'cw', rot_dir_live: 'cw', coils: []
 };
 for (let i = 1; i <= N; i++) {
   state.coils.push({ id: i, en: 0, mag: 0, dir: 1, duty: 0, i: 0, lim: 2 });
@@ -587,6 +598,12 @@ async function setRotDir(d) {
   syncLabels();
 }
 
+async function setAxis(a) {
+  const ok = await sendCmd('axis ' + a);
+  if (ok) state.axis = a;
+  syncLabels();
+}
+
 async function setMode(m) {
   await sendCmd('mode ' + m);
 }
@@ -625,13 +642,20 @@ function syncLabels() {
   document.getElementById('cfgModeLabel').textContent = state.mode;
   document.getElementById('cfgContourLabel').textContent = state.contour ? 'ON' : 'off';
   document.getElementById('cfgRotLabel').textContent = state.rotate ? 'ON' : 'off';
+  const axis = state.axis || 'z';
+  document.getElementById('cfgAxisLabel').textContent = axis.toUpperCase();
   document.getElementById('modeOpenBtn').classList.toggle('active', state.mode === 'open');
   document.getElementById('modeClosedBtn').classList.toggle('active', state.mode === 'closed');
   document.getElementById('dirCwBtn').classList.toggle('active', state.rot_dir === 'cw');
   document.getElementById('dirCcwBtn').classList.toggle('active', state.rot_dir === 'ccw');
+  const az = document.getElementById('axisZBtn');
+  const ax = document.getElementById('axisXBtn');
+  if (az) az.classList.toggle('active', axis === 'z');
+  if (ax) ax.classList.toggle('active', axis === 'x');
 
   const shownAmp = displayAmp();
   document.getElementById('stRot').textContent = state.rotate ? 'ON' : 'off';
+  document.getElementById('stAxis').textContent = axis;
   document.getElementById('stFreq').textContent = (+state.freq).toFixed(2);
   document.getElementById('stAmp').textContent = shownAmp;
   document.getElementById('stDir').textContent = state.rot_dir;
@@ -644,14 +668,31 @@ function syncLabels() {
   document.getElementById('phaseAI').textContent = ia.toFixed(3);
   document.getElementById('phaseBI').textContent = ib.toFixed(3);
 
+  const paRole = document.getElementById('phaseARole');
+  const pbRole = document.getElementById('phaseBRole');
+  if (paRole && pbRole) {
+    if (axis === 'x') {
+      paRole.textContent = 'X: idle (axis of rotation)';
+      pbRole.textContent = 'X: in-phase → net Bz';
+    } else {
+      paRole.textContent = 'Z: Phase A @ 0°';
+      pbRole.textContent = 'Z: Phase B @ ±90°';
+    }
+  }
+
   const hint = document.getElementById('plotRunHint');
   if (hint) {
     if (!state.rotate) hint.textContent = 'rotate off → flat';
-    else if (!(+shownAmp > 0)) hint.textContent = 'rotate ON but amp=0 → set Amplitude to see waves';
+    else if (!(+shownAmp > 0) && !(+state.amp > 0)) hint.textContent = 'rotate ON but amp=0 → set Amplitude to see waves';
     else {
       const derated = state.amp_live != null && +state.amp_live < +state.amp;
-      hint.textContent = `rotate ON · ${(+state.freq).toFixed(2)} Hz · amp ${shownAmp}` +
-        (derated ? ` (cmd ${state.amp})` : '') + ` · ${state.rot_dir}`;
+      const flipping = state.rot_dir_live && state.rot_dir && state.rot_dir_live !== state.rot_dir;
+      const axisFlip = state.axis_live && state.axis && state.axis_live !== state.axis;
+      const ramping = derated || flipping || axisFlip || (+shownAmp !== +state.amp);
+      hint.textContent = `rotate ON · ${axis.toUpperCase()} · ${(+state.freq).toFixed(2)} Hz · amp ${shownAmp}` +
+        (derated || ramping ? ` (cmd ${state.amp})` : '') +
+        ` · ${flipping ? state.rot_dir_live + '→' + state.rot_dir : state.rot_dir}` +
+        (ramping ? ' · ramping' : '');
     }
   }
 
@@ -748,10 +789,12 @@ function applyStatus(s) {
     state.amp_live = state.amp;
   }
 
-  if (s.rot_dir && !(document.activeElement && document.activeElement.id &&
-      (document.activeElement.id === 'dirCwBtn' || document.activeElement.id === 'dirCcwBtn'))) {
-    state.rot_dir = s.rot_dir;
-  }
+  if (s.rot_dir) state.rot_dir = s.rot_dir;
+  if (s.rot_dir_live) state.rot_dir_live = s.rot_dir_live;
+  else if (s.rot_dir) state.rot_dir_live = s.rot_dir;
+  if (s.axis) state.axis = s.axis;
+  if (s.axis_live) state.axis_live = s.axis_live;
+  else if (s.axis) state.axis_live = s.axis;
   s.coils.forEach((c, idx) => {
     if (!state.coils[idx]) return;
     Object.assign(state.coils[idx], c);
@@ -802,7 +845,7 @@ function render(rebuild) {
       d.id = 'card' + idx;
       d.innerHTML = `
         <div class="card-head">
-          <h2>Coil M${c.id}${idx < 4 ? (idx % 2 === 0 ? ' · A' : ' · B') : ''}</h2>
+          <h2>Coil M${c.id}${idx % 2 === 0 ? ' · X' : ' · Y'}</h2>
           <label class="switch" title="Enable">
             <input type="checkbox" ${c.en ? 'checked' : ''} ${locked ? 'disabled' : ''}
               onchange="toggleEn(${idx}, this.checked)">
@@ -940,14 +983,22 @@ function resizeWaveCanvas() {
 }
 
 function coilDutyAt(tSec, phaseKey) {
-  /* Preview soft-clamped waveform when rotate is on (amp=0 → flat). */
+  /* Preview live waveform when rotate is on (amp=0 → flat). */
   if (!state.rotate) return 0;
   const f = Math.max(0.1, +state.freq || 0);
   const amp = Math.max(0, Math.min(255, +displayAmp() || 0));
   const theta = 2 * Math.PI * f * tSec;
+  const liveDir = state.rot_dir_live || state.rot_dir;
+  const axis = state.axis_live || state.axis || 'z';
+  if (axis === 'x') {
+    /* M1/M3 (A) idle; M2/M4 (B) identical sine */
+    if (phaseKey === 'A') return 0;
+    const s = amp * Math.sin(theta);
+    return liveDir === 'ccw' ? -s : s;
+  }
   if (phaseKey === 'A') return amp * Math.sin(theta);
   const c = Math.cos(theta);
-  return amp * (state.rot_dir === 'ccw' ? -c : c);
+  return amp * (liveDir === 'ccw' ? -c : c);
 }
 
 function drawWavePlot() {

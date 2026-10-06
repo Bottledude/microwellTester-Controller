@@ -1,14 +1,20 @@
 /**
  * @file main.c
- * @brief STM32H743VIT6 (WeAct Mini) coil driver for up to 6× BTS7960 / IBT-2.
+ * @brief STM32H743VIT6 (WeAct Mini) coil driver for 4× BTS7960 / IBT-2.
  *
- * Each BTS7960 drives one coil (≤ ~2 A). Magnitude is native 0–255 PWM duty
- * at a high carrier (~40 kHz). Direction selects RPWM vs LPWM (B-field polarity).
+ * Four coils sit 90° apart around the sample, each tilted ~45° so a coil
+ * contributes both in-plane and vertical field at the centre.
+ *
+ *   M1 @ 0° (X+), M2 @ 90° (Y+), M3 @ 180° (X−), M4 @ 270° (Y−)
  *
  * Dual modes:
  *   DC     — constant magnitude/dir per coil (open- or closed-loop IS)
- *   Rotate — open-loop quadrature sine on M1–M4 (M1∥M3 @ 0°, M2∥M4 @ ±90°)
- *            shared freq (0.1–50 Hz) + amp; TIM6 ~10 kHz sine ISR
+ *   Rotate Z — in-plane quadrature sine (M1∥M3 @ 0°, M2∥M4 @ ±90°)
+ *   Rotate X — M2∥M4 driven in-phase (same current direction). Horizontal
+ *              components cancel; vertical components add. Varying that
+ *              common current produces torque about the X-axis (M1–M3).
+ *
+ * Shared freq (0.1–50 Hz) + amp; TIM6 ~10 kHz sine ISR; amp ramps ~1.3 s.
  *
  * Serial CLI @ 115200 8N1:
  *   USART1 PA9 TX / PA10 RX  — USB-UART Serial Monitor (human, with echo)
@@ -28,8 +34,6 @@
  *   M2    PE5      PE6      PE4     PA1   (TIM15)
  *   M3    PC6      PC7      PC5     PA2
  *   M4    PC8      PC9      PC4     PA3
- *   M5    PA6      PA7      PB10    PA4
- *   M6    PB0      PB1      PB11    PA5
  *
  * Onboard ST7735 (SPI4): PE12 SCK, PE14 MOSI, PE11 CS, PE13 DC, PE10 BL.
  *
@@ -59,10 +63,10 @@ static int str_ieq(const char *a, const char *b)
 }
 
 #ifndef NUM_COILS
-#define NUM_COILS 6
+#define NUM_COILS 4
 #endif
-#if (NUM_COILS < 1) || (NUM_COILS > 6)
-#error "NUM_COILS must be 1..6"
+#if NUM_COILS != 4
+#error "This firmware drives four coils (M1–M4)"
 #endif
 
 #ifndef PWM_TARGET_HZ
@@ -80,6 +84,9 @@ static int str_ieq(const char *a, const char *b)
 #define SINE_LUT_SIZE           256
 #define ROTATE_FREQ_MIN_HZ      0.1f
 #define ROTATE_FREQ_MAX_HZ      50.0f
+#ifndef ROTATE_RAMP_STEP
+#define ROTATE_RAMP_STEP        1u   /* live-amp LSB per 200 Hz tick; 0↔255 ≈ 1.3 s */
+#endif
 
 /* BTS7960 sense: Iload ≈ Vis * k_ris / Ris. Datasheet k ≈ 8500. */
 #ifndef IS_RIS_OHM
@@ -103,9 +110,14 @@ typedef enum {
 } CtrlMode;
 
 typedef enum {
-  ROT_CW = 0,  /* Phase B = +90° (cos) */
-  ROT_CCW = 1  /* Phase B = −90° (−cos) */
+  ROT_CW = 0,  /* Z: Phase B = +90° (cos).  X: M2∥M4 sine as-is */
+  ROT_CCW = 1  /* Z: Phase B = −90° (−cos). X: invert common sine */
 } RotateDir;
+
+typedef enum {
+  ROT_AXIS_Z = 0, /* in-plane quadrature on all four coils */
+  ROT_AXIS_X = 1  /* M2∥M4 in-phase → net vertical field, torque about X */
+} RotateAxis;
 
 typedef struct {
   GPIO_TypeDef *port;
@@ -135,43 +147,33 @@ typedef struct {
 } CoilState;
 
 /* -------------------- pin / timer map -------------------- */
-static const CoilHw COIL_HW[6] = {
-  /* M1 */ { TIM4, TIM_CHANNEL_3, TIM_CHANNEL_4,
+static const CoilHw COIL_HW[4] = {
+  /* M1 X+ 0°   */ { TIM4, TIM_CHANNEL_3, TIM_CHANNEL_4,
              { GPIOD, GPIO_PIN_14, GPIO_AF2_TIM4 },
              { GPIOD, GPIO_PIN_15, GPIO_AF2_TIM4 },
              GPIOD, GPIO_PIN_10, ADC_CHANNEL_16 }, /* IS on PA0 = ADC1_INP16 */
-  /* M2 */ { TIM15, TIM_CHANNEL_1, TIM_CHANNEL_2,
+  /* M2 Y+ 90°  */ { TIM15, TIM_CHANNEL_1, TIM_CHANNEL_2,
              { GPIOE, GPIO_PIN_5,  GPIO_AF4_TIM15 },
              { GPIOE, GPIO_PIN_6,  GPIO_AF4_TIM15 },
              GPIOE, GPIO_PIN_4,  ADC_CHANNEL_17 }, /* IS on PA1 */
-  /* M3 */ { TIM8, TIM_CHANNEL_1, TIM_CHANNEL_2,
+  /* M3 X− 180° */ { TIM8, TIM_CHANNEL_1, TIM_CHANNEL_2,
              { GPIOC, GPIO_PIN_6,  GPIO_AF3_TIM8 },
              { GPIOC, GPIO_PIN_7,  GPIO_AF3_TIM8 },
              GPIOC, GPIO_PIN_5,  ADC_CHANNEL_14 }, /* IS on PA2 */
-  /* M4 */ { TIM8, TIM_CHANNEL_3, TIM_CHANNEL_4,
+  /* M4 Y− 270° */ { TIM8, TIM_CHANNEL_3, TIM_CHANNEL_4,
              { GPIOC, GPIO_PIN_8,  GPIO_AF3_TIM8 },
              { GPIOC, GPIO_PIN_9,  GPIO_AF3_TIM8 },
              GPIOC, GPIO_PIN_4,  ADC_CHANNEL_15 }, /* IS on PA3 */
-  /* M5 */ { TIM3, TIM_CHANNEL_1, TIM_CHANNEL_2,
-             { GPIOA, GPIO_PIN_6,  GPIO_AF2_TIM3 },
-             { GPIOA, GPIO_PIN_7,  GPIO_AF2_TIM3 },
-             GPIOB, GPIO_PIN_10, ADC_CHANNEL_18 }, /* IS on PA4 */
-  /* M6 */ { TIM3, TIM_CHANNEL_3, TIM_CHANNEL_4,
-             { GPIOB, GPIO_PIN_0,  GPIO_AF2_TIM3 },
-             { GPIOB, GPIO_PIN_1,  GPIO_AF2_TIM3 },
-             GPIOB, GPIO_PIN_11, ADC_CHANNEL_19 }, /* IS on PA5 */
 };
 
-/* PA0..PA5 ADC1 channels on H743: INP16..INP19 for PA0..PA3, INP18/19 for PA4/PA5
- * Correct H743 ADC1 mapping:
- *   PA0 ADC1_INP16, PA1 ADC1_INP17, PA2 ADC1_INP14, PA3 ADC1_INP15,
- *   PA4 ADC1_INP18, PA5 ADC1_INP19
+/* PA0..PA3 ADC1 channels on H743:
+ *   PA0 ADC1_INP16, PA1 ADC1_INP17, PA2 ADC1_INP14, PA3 ADC1_INP15
  */
 
 static UART_HandleTypeDef huart1;
 static UART_HandleTypeDef huart3;
 static ADC_HandleTypeDef  hadc1;
-static TIM_HandleTypeDef  htim3, htim4, htim8, htim15, htim6;
+static TIM_HandleTypeDef  htim4, htim8, htim15, htim6;
 
 static CoilState coils[NUM_COILS];
 static CtrlMode  g_ctrl_mode = CTRL_OPEN;
@@ -181,8 +183,12 @@ static uint8_t   g_contour_active;
 static volatile uint8_t  g_rotate_active;
 static float             g_rotate_freq_hz = 1.0f;
 static uint8_t           g_rotate_amp = 0;
-static volatile uint8_t  g_rotate_amp_live = 0; /* may be soft-clamped */
-static RotateDir         g_rotate_dir = ROT_CW;
+static volatile uint8_t  g_rotate_amp_live = 0; /* ramp + soft-clamp */
+static RotateDir         g_rotate_dir = ROT_CW;      /* applied in sine ISR */
+static RotateDir         g_rotate_dir_want = ROT_CW; /* operator setpoint */
+static RotateAxis        g_rotate_axis = ROT_AXIS_Z;
+static RotateAxis        g_rotate_axis_want = ROT_AXIS_Z;
+static volatile uint8_t  g_rotate_stop_pending;
 static volatile uint32_t g_phase;
 static volatile uint32_t g_phase_inc;
 
@@ -252,8 +258,12 @@ static void Coil_ApplySignedDuty(uint8_t idx, int16_t signed_duty);
 static void Coil_AllOff(void);
 static void Rotate_RecalcPhaseInc(void);
 static void Rotate_Stop(void);
+static void Rotate_RequestStop(void);
 static void Rotate_Start(void);
+static void Rotate_SetDir(RotateDir d);
+static void Rotate_SetAxis(RotateAxis a);
 static void Rotate_StopIfDcConflict(uint8_t idx);
+static void Rotate_RampUpdate(void);
 static float Sense_ReadAmps(uint8_t idx);
 static void CurrentLoop_Update(void);
 static void CLI_PollPort(CliPort *port);
@@ -552,7 +562,6 @@ static void tim_start_channel(TIM_HandleTypeDef *htim, uint32_t ch)
 
 static void MX_TIMx_Init(void)
 {
-  __HAL_RCC_TIM3_CLK_ENABLE();
   __HAL_RCC_TIM4_CLK_ENABLE();
   __HAL_RCC_TIM8_CLK_ENABLE();
   __HAL_RCC_TIM15_CLK_ENABLE();
@@ -562,7 +571,6 @@ static void MX_TIMx_Init(void)
     tim_pwm_gpio(&COIL_HW[i].lpwm);
   }
 
-  tim_apply_base(&htim3, TIM3);
   tim_apply_base(&htim4, TIM4);
   tim_apply_base(&htim8, TIM8);
   tim_apply_base(&htim15, TIM15);
@@ -631,8 +639,8 @@ static void MX_ADC1_Init(void)
   __HAL_RCC_ADC12_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /* PA0..PA5 analog for IS */
-  g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4 | GPIO_PIN_5;
+  /* PA0..PA3 analog for IS (M1–M4) */
+  g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3;
   g.Mode = GPIO_MODE_ANALOG;
   g.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &g);
@@ -670,7 +678,8 @@ static TIM_HandleTypeDef *tim_handle_for(const CoilHw *hw)
   if (hw->tim == TIM4) return &htim4;
   if (hw->tim == TIM8) return &htim8;
   if (hw->tim == TIM15) return &htim15;
-  return &htim3;
+  Error_Handler();
+  return &htim4;
 }
 
 static void Display_PushStatus(void)
@@ -690,6 +699,7 @@ static void Display_PushStatus(void)
                    g_rotate_active,
                    g_rotate_freq_hz,
                    g_rotate_amp_live,
+                   g_rotate_axis == ROT_AXIS_X ? 1 : 0,
                    snap, NUM_COILS);
 }
 
@@ -783,12 +793,40 @@ static void Rotate_RecalcPhaseInc(void)
   g_phase_inc = (uint32_t)inc;
 }
 
+static const char *rotate_dir_str(RotateDir d)
+{
+  return d == ROT_CW ? "cw" : "ccw";
+}
+
+static const char *rotate_axis_str(RotateAxis a)
+{
+  return a == ROT_AXIS_X ? "x" : "z";
+}
+
+static uint8_t rotate_step_toward(uint8_t cur, uint8_t tgt)
+{
+  if (cur == tgt) return cur;
+  uint8_t step = (uint8_t)ROTATE_RAMP_STEP;
+  if (step < 1u) step = 1u;
+  if (cur < tgt) {
+    uint8_t d = (uint8_t)(tgt - cur);
+    return (uint8_t)(cur + (d < step ? d : step));
+  }
+  {
+    uint8_t d = (uint8_t)(cur - tgt);
+    return (uint8_t)(cur - (d < step ? d : step));
+  }
+}
+
 static void Rotate_Stop(void)
 {
   g_rotate_active = 0;
+  g_rotate_stop_pending = 0;
   g_contour_active = 0; /* idle header/json must not keep a stale contour flag */
   HAL_TIM_Base_Stop_IT(&htim6);
-  g_rotate_amp_live = g_rotate_amp;
+  g_rotate_amp_live = 0;
+  g_rotate_dir = g_rotate_dir_want;
+  g_rotate_axis = g_rotate_axis_want;
 
   int n = (NUM_COILS < NUM_ROTATE_COILS) ? NUM_COILS : NUM_ROTATE_COILS;
   for (int i = 0; i < n; i++) {
@@ -799,6 +837,28 @@ static void Rotate_Stop(void)
   }
 }
 
+static void Rotate_RequestStop(void)
+{
+  if (!g_rotate_active) {
+    Rotate_Stop();
+    return;
+  }
+  g_rotate_stop_pending = 1;
+}
+
+static void Rotate_SetDir(RotateDir d)
+{
+  g_rotate_dir_want = d;
+  /* Idle: apply immediately. While rotating, ramp to 0, flip, ramp back up. */
+  if (!g_rotate_active) g_rotate_dir = d;
+}
+
+static void Rotate_SetAxis(RotateAxis a)
+{
+  g_rotate_axis_want = a;
+  if (!g_rotate_active) g_rotate_axis = a;
+}
+
 static void Rotate_Start(void)
 {
 #if (NUM_COILS < NUM_ROTATE_COILS)
@@ -806,9 +866,18 @@ static void Rotate_Start(void)
   return;
 #else
   g_contour_active = 0;
+  g_rotate_stop_pending = 0;
   Rotate_RecalcPhaseInc();
+
+  if (g_rotate_active) {
+    /* Already running (or ramping down) — cancel stop and ramp toward amp. */
+    return;
+  }
+
   g_phase = 0;
-  g_rotate_amp_live = g_rotate_amp;
+  g_rotate_amp_live = 0; /* fade in from zero */
+  g_rotate_dir = g_rotate_dir_want;
+  g_rotate_axis = g_rotate_axis_want;
 
   for (int i = 0; i < NUM_ROTATE_COILS; i++) {
     coils[i].enabled = 1;
@@ -819,6 +888,50 @@ static void Rotate_Start(void)
   g_rotate_active = 1;
   HAL_TIM_Base_Start_IT(&htim6);
 #endif
+}
+
+static void Rotate_RampUpdate(void)
+{
+  if (!g_rotate_active) return;
+
+  uint8_t axis_mismatch = (g_rotate_axis != g_rotate_axis_want);
+  uint8_t dir_mismatch = (g_rotate_dir != g_rotate_dir_want);
+
+  if ((dir_mismatch || axis_mismatch) && g_rotate_amp_live == 0 &&
+      !g_rotate_stop_pending) {
+    g_rotate_dir = g_rotate_dir_want;
+    g_rotate_axis = g_rotate_axis_want;
+    dir_mismatch = 0;
+    axis_mismatch = 0;
+  }
+
+  uint8_t target = g_rotate_amp;
+  if (g_rotate_stop_pending || dir_mismatch || axis_mismatch) {
+    target = 0;
+  }
+
+  uint8_t over = 0;
+  for (uint8_t i = 0; i < NUM_ROTATE_COILS && i < NUM_COILS; i++) {
+    if (coils[i].i_limit_a > 0.0f && coils[i].i_meas_a > coils[i].i_limit_a) {
+      over = 1;
+      break;
+    }
+  }
+
+  if (over && g_rotate_amp_live > 0) {
+    /* One step down per tick — don't also ramp up into the limit. */
+    if (g_rotate_amp_live > target) {
+      g_rotate_amp_live = rotate_step_toward(g_rotate_amp_live, target);
+    } else if (g_rotate_amp_live > 0) {
+      g_rotate_amp_live--;
+    }
+  } else {
+    g_rotate_amp_live = rotate_step_toward(g_rotate_amp_live, target);
+  }
+
+  if (g_rotate_stop_pending && g_rotate_amp_live == 0) {
+    Rotate_Stop();
+  }
 }
 
 static void Rotate_StopIfDcConflict(uint8_t idx)
@@ -909,10 +1022,7 @@ static void CurrentLoop_Update(void)
 
     /* Rotating field owns M1–M4; sense for soft amp clamp / display only */
     if (g_rotate_active && i < NUM_ROTATE_COILS) {
-      float i_meas = Sense_ReadAmps(i);
-      if (st->i_limit_a > 0.0f && i_meas > st->i_limit_a) {
-        if (g_rotate_amp_live > 0) g_rotate_amp_live--;
-      }
+      Sense_ReadAmps(i);
       continue;
     }
 
@@ -961,18 +1071,7 @@ static void CurrentLoop_Update(void)
     Coil_ApplyOutputs(i);
   }
 
-  /* Recover soft-clamped rotate amp toward commanded amp when under limit */
-  if (g_rotate_active && g_rotate_amp_live < g_rotate_amp) {
-    uint8_t under = 1;
-    for (uint8_t i = 0; i < NUM_ROTATE_COILS && i < NUM_COILS; i++) {
-      if (coils[i].i_limit_a > 0.0f &&
-          coils[i].i_meas_a > coils[i].i_limit_a * 0.9f) {
-        under = 0;
-        break;
-      }
-    }
-    if (under) g_rotate_amp_live++;
-  }
+  Rotate_RampUpdate();
 }
 
 /* -------------------- CLI -------------------- */
@@ -1003,17 +1102,18 @@ static void CLI_PrintHelp(void)
     "help                         show this help\r\n"
     "status                       show coil states + currents\r\n"
     "sense                        sample IS currents once\r\n"
-    "on <M1..M6> [..]             enable coil(s) [DC]\r\n"
-    "off <M1..M6|all> [..]        disable coil(s)\r\n"
+    "on <M1..M4> [..]             enable coil(s) [DC]\r\n"
+    "off <M1..M4|all> [..]        disable coil(s)\r\n"
     "set <M#|all> <0..255>        magnitude (duty / Iref scale) [DC]\r\n"
     "dir <M#|all> <+|->           B-field / current direction [DC]\r\n"
     "drive <M#> <0..255> <+|->    set mag+dir and enable [DC]\r\n"
     "limit <M#|all> <0..255>      soft current limit (255=~2A, 0=off)\r\n"
     "mode open|closed             open-loop duty vs IS closed-loop [DC]\r\n"
-    "rotate on|off                quadrature sine on M1..M4 (set amp first)\r\n"
+    "rotate on|off                start/stop field (amp ramps ~1.3s)\r\n"
+    "axis z|x                     Z = in-plane quadrature; X = M2||M4 in-phase\r\n"
     "freq <Hz>                    rotate freq 0.1..50 Hz\r\n"
     "amp <0..255>                 shared sine peak amplitude (default 0)\r\n"
-    "rot_dir cw|ccw               Phase B lead (+90) or lag (-90)\r\n"
+    "rot_dir cw|ccw               Z: Phase B +/-90; X: invert M2||M4 sine\r\n"
     "contour on|off               enable M1..M4 together (DC contour)\r\n"
     "program P1|P2|stop           preset patterns\r\n"
     "  P1 = M1..M4 ON (keep mag/dir)\r\n"
@@ -1022,9 +1122,12 @@ static void CLI_PrintHelp(void)
     "json                         machine-readable status (ESP32 / UI)\r\n"
     "ping                         bridge heartbeat (replies PONG)\r\n"
     "\r\n"
-    "Rotate: M1||M3 = Phase A (0 deg), M2||M4 = Phase B (+/-90 deg)\r\n"
-    "DC writes to M1..M4 auto-stop rotate. Limits while rotating derate shared amp.\r\n"
-    "Boot soft-limits all coils to ~2 A (limit … 0 disables).\r\n"
+    "Coils at 90 deg, tilted ~45 deg (in-plane + vertical at centre).\r\n"
+    "Z: M1||M3 Phase A (0 deg), M2||M4 Phase B (+/-90 deg) — in-plane rotate.\r\n"
+    "X: M2||M4 same-direction sine (horiz. cancel, vert. add) — torque about X (M1-M3).\r\n"
+    "Start/stop/CW↔CCW/axis change fade live amp through 0 (~1.3 s 0↔255).\r\n"
+    "off all cuts immediately. DC writes to M1..M4 auto-stop rotate.\r\n"
+    "Limits while rotating derate shared amp. Boot soft-limits ~2 A (limit … 0 disables).\r\n"
     "\r\n"
   );
 }
@@ -1033,14 +1136,15 @@ static void CLI_PrintStatus(void)
 {
   float fpwm = (float)timer_clock_hz(TIM4) /
                ((float)(htim4.Init.Prescaler + 1U) * (float)(PWM_ARR + 1U));
-  uart_printf("mode=%s  contour=%u  rotate=%u  freq=%.2f Hz  amp=%u  amp_live=%u  rot_dir=%s\r\n",
+  uart_printf("mode=%s  contour=%u  rotate=%u  axis=%s  freq=%.2f Hz  amp=%u  amp_live=%u  rot_dir=%s\r\n",
               g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
               (unsigned)g_contour_active,
               (unsigned)g_rotate_active,
+              rotate_axis_str(g_rotate_axis_want),
               (double)g_rotate_freq_hz,
               (unsigned)g_rotate_amp,
               (unsigned)g_rotate_amp_live,
-              g_rotate_dir == ROT_CW ? "cw" : "ccw");
+              rotate_dir_str(g_rotate_dir_want));
   uart_printf("pwm≈%.1f kHz  sine_isr=%u Hz  coils=%d\r\n",
               fpwm / 1000.0f, (unsigned)SINE_UPDATE_HZ, NUM_COILS);
   for (int i = 0; i < NUM_COILS; i++) {
@@ -1082,14 +1186,19 @@ static void CLI_HandleLine(char *line)
     static char js[896];
     int n = snprintf(js, sizeof(js),
                      "{\"ok\":1,\"mode\":\"%s\",\"contour\":%u,\"rotate\":%u,"
-                     "\"freq\":%.2f,\"amp\":%u,\"amp_live\":%u,\"rot_dir\":\"%s\",\"n\":%d,\"coils\":[",
+                     "\"axis\":\"%s\",\"axis_live\":\"%s\","
+                     "\"freq\":%.2f,\"amp\":%u,\"amp_live\":%u,"
+                     "\"rot_dir\":\"%s\",\"rot_dir_live\":\"%s\",\"n\":%d,\"coils\":[",
                      g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
                      (unsigned)g_contour_active,
                      (unsigned)g_rotate_active,
+                     rotate_axis_str(g_rotate_axis_want),
+                     rotate_axis_str(g_rotate_axis),
                      (double)g_rotate_freq_hz,
                      (unsigned)g_rotate_amp,
                      (unsigned)g_rotate_amp_live,
-                     g_rotate_dir == ROT_CW ? "cw" : "ccw",
+                     rotate_dir_str(g_rotate_dir_want),
+                     rotate_dir_str(g_rotate_dir),
                      NUM_COILS);
     for (int i = 0; i < NUM_COILS && n > 0 && n < (int)sizeof(js) - 120; i++) {
       CoilState *s = &coils[i];
@@ -1297,12 +1406,13 @@ static void CLI_HandleLine(char *line)
     if (argc < 2) { uart_write("usage: rotate on|off\r\n"); return; }
     if (str_ieq(argv[1], "on")) {
       Rotate_Start();
-      uart_printf("rotate ON freq=%.2f amp=%u dir=%s\r\n",
+      uart_printf("rotate ON axis=%s freq=%.2f amp=%u dir=%s (ramping)\r\n",
+                  rotate_axis_str(g_rotate_axis_want),
                   (double)g_rotate_freq_hz, (unsigned)g_rotate_amp,
-                  g_rotate_dir == ROT_CW ? "cw" : "ccw");
+                  rotate_dir_str(g_rotate_dir_want));
     } else if (str_ieq(argv[1], "off")) {
-      Rotate_Stop();
-      uart_write("rotate OFF\r\n");
+      Rotate_RequestStop();
+      uart_write("rotate OFF (ramping)\r\n");
     } else {
       uart_write("usage: rotate on|off\r\n");
     }
@@ -1324,7 +1434,6 @@ static void CLI_HandleLine(char *line)
     if (a < 0) a = 0;
     if (a > 255) a = 255;
     g_rotate_amp = (uint8_t)a;
-    g_rotate_amp_live = g_rotate_amp;
     for (int i = 0; i < NUM_ROTATE_COILS && i < NUM_COILS; i++) {
       coils[i].magnitude = g_rotate_amp;
     }
@@ -1334,13 +1443,26 @@ static void CLI_HandleLine(char *line)
   if (!strcmp(cmd, "rot_dir") || !strcmp(cmd, "rotdir")) {
     if (argc < 2) { uart_write("usage: rot_dir cw|ccw\r\n"); return; }
     if (str_ieq(argv[1], "cw") || str_ieq(argv[1], "+") || str_ieq(argv[1], "fwd")) {
-      g_rotate_dir = ROT_CW;
+      Rotate_SetDir(ROT_CW);
       uart_write("rot_dir=cw\r\n");
     } else if (str_ieq(argv[1], "ccw") || str_ieq(argv[1], "-") || str_ieq(argv[1], "rev")) {
-      g_rotate_dir = ROT_CCW;
+      Rotate_SetDir(ROT_CCW);
       uart_write("rot_dir=ccw\r\n");
     } else {
       uart_write("usage: rot_dir cw|ccw\r\n");
+    }
+    return;
+  }
+  if (!strcmp(cmd, "axis") || !strcmp(cmd, "rot_axis")) {
+    if (argc < 2) { uart_write("usage: axis z|x\r\n"); return; }
+    if (str_ieq(argv[1], "z") || str_ieq(argv[1], "xy") || str_ieq(argv[1], "inplane")) {
+      Rotate_SetAxis(ROT_AXIS_Z);
+      uart_write("axis=z (in-plane quadrature M1-M4)\r\n");
+    } else if (str_ieq(argv[1], "x")) {
+      Rotate_SetAxis(ROT_AXIS_X);
+      uart_write("axis=x (M2||M4 in-phase, torque about X)\r\n");
+    } else {
+      uart_write("usage: axis z|x\r\n");
     }
     return;
   }
@@ -1398,7 +1520,7 @@ int main(void)
     coils[i].i_limit_a = I_FULLSCALE_A; /* default soft cap ≈ 2 A */
   }
   Rotate_RecalcPhaseInc();
-  g_rotate_amp_live = g_rotate_amp;
+  g_rotate_amp_live = 0;
 
   /* Port 0: Serial Monitor. Port 1: ESP32 bridge (no echo). */
   cli_ports[0].usart = USART1;
@@ -1469,18 +1591,28 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
   g_phase += g_phase_inc;
   uint8_t si = (uint8_t)(g_phase >> 24); /* top 8 bits → 256-entry LUT */
-  int32_t s = SINE_LUT[si];
-  int32_t c = SINE_LUT[(uint8_t)(si + 64U)]; /* +90° */
-  if (g_rotate_dir == ROT_CCW) c = -c;
-
   uint8_t amp = g_rotate_amp_live;
-  int16_t d_a = (int16_t)((s * (int32_t)amp) >> 15);
-  int16_t d_b = (int16_t)((c * (int32_t)amp) >> 15);
 
-  Coil_ApplySignedDuty(0, d_a); /* M1 Phase A */
-  Coil_ApplySignedDuty(1, d_b); /* M2 Phase B */
-  Coil_ApplySignedDuty(2, d_a); /* M3 Phase A */
-  Coil_ApplySignedDuty(3, d_b); /* M4 Phase B */
+  if (g_rotate_axis == ROT_AXIS_X) {
+    /* M2 and M4 same signed sine: 45° coils → net Bz, torque about X (M1–M3). */
+    int32_t s = SINE_LUT[si];
+    if (g_rotate_dir == ROT_CCW) s = -s;
+    int16_t d = (int16_t)((s * (int32_t)amp) >> 15);
+    Coil_ApplySignedDuty(0, 0); /* M1 idle */
+    Coil_ApplySignedDuty(1, d); /* M2 */
+    Coil_ApplySignedDuty(2, 0); /* M3 idle */
+    Coil_ApplySignedDuty(3, d); /* M4 same direction as M2 */
+  } else {
+    int32_t s = SINE_LUT[si];
+    int32_t c = SINE_LUT[(uint8_t)(si + 64U)]; /* +90° */
+    if (g_rotate_dir == ROT_CCW) c = -c;
+    int16_t d_a = (int16_t)((s * (int32_t)amp) >> 15);
+    int16_t d_b = (int16_t)((c * (int32_t)amp) >> 15);
+    Coil_ApplySignedDuty(0, d_a); /* M1 Phase A */
+    Coil_ApplySignedDuty(1, d_b); /* M2 Phase B */
+    Coil_ApplySignedDuty(2, d_a); /* M3 Phase A */
+    Coil_ApplySignedDuty(3, d_b); /* M4 Phase B */
+  }
 }
 
 void NMI_Handler(void) {}

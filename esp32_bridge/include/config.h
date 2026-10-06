@@ -14,6 +14,6 @@
 #define PIN_STM32_TX       17   /* ESP32 GPIO17 → STM32 PD9 (RX) */
 #define PIN_STM32_RX       18   /* ESP32 GPIO18 ← STM32 PD8 (TX) */
 
-#define NUM_COILS          6
+#define NUM_COILS          4
 #define STATUS_POLL_MS     400
 #define STM32_CMD_TIMEOUT_MS 1500

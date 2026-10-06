@@ -1,8 +1,10 @@
 # Soft Magnetic Composite Controller
 
-PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H743VIT6** and up to six **BTS7960 / IBT-2** half-bridge drivers. An optional **ESP32-S3 N16R8** provides a WiFi SoftAP and lab-oriented browser UI while the STM32 Serial Monitor CLI remains available in parallel.
+PlatformIO firmware for driving **four** soft-magnetic coils with a **WeAct Mini STM32H743VIT6** and **BTS7960 / IBT-2** half-bridge drivers. An optional **ESP32-S3 N16R8** provides a WiFi SoftAP and lab-oriented browser UI while the STM32 Serial Monitor CLI remains available in parallel.
 
 **Repo:** https://github.com/Bottledude/softMagneticComposite-Controller
+
+This firmware is **four coils only** (M1–M4). M5/M6 and TIM3 are gone. Flash **both** the STM32 and the ESP32 after pulling this tree.
 
 ## Architecture
 
@@ -18,7 +20,7 @@ PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H74
                                        │
                           PWM + EN + IS (ADC)
                                        ▼
-                         BTS7960 ×1…6 → coils (~2 A each)
+                         BTS7960 ×4 → coils (~2 A each)
 ```
 
 | Role | Board | Firmware |
@@ -28,15 +30,22 @@ PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H74
 
 ## Features
 
-- Up to **6 coils**, each on its own BTS7960 (RPWM / LPWM / EN / IS)
+- **4 coils** at **90°** around the sample, each on its own BTS7960 (RPWM / LPWM / EN / IS)
+- Coils are **tilted ~45°** so each contributes both an in-plane and a vertical field at the centre
 - **~40 kHz PWM carrier**, duty **0–255**
 - **DC mode:** constant magnitude + direction per coil (open- or closed-loop IS)
-- **Rotating field mode:** open-loop quadrature sine on **M1–M4**
-  - Phase A = M1 ∥ M3 @ 0°
+- **Rotate Z (in-plane):** open-loop quadrature sine on all four coils
+  - Phase A = M1 ∥ M3 @ 0° (X)
   - Phase B = M2 ∥ M4 @ +90° (CW) or −90° (CCW)
-  - Shared **frequency** (0.1–50 Hz, default 1 Hz) and **amplitude** (0–255, **default 0** — set `amp` before `rotate on`)
-  - ~10 kHz sine update ISR for high waveform resolution
-- Soft current limits (`limit`); boot-on all coils at ~2 A; while rotating, over-limit **derates shared live amplitude** (`amp_live` in `status` / `json`)
+- **Rotate X:** M2 ∥ M4 driven **in-phase** (same signed sine)
+  - Horizontal components cancel at the centre; vertical components add (net Bz)
+  - Varying that common current produces torque about the **X-axis** (M1–M3)
+  - M1 and M3 stay **idle** (duty 0)
+  - CW/CCW inverts the common M2∥M4 sine
+- Shared **frequency** (0.1–50 Hz, default 1 Hz) and **amplitude** (0–255, **default 0** — set `amp` before `rotate on`)
+- ~10 kHz sine update ISR
+- **Amp ramp** (~1.3 s for 0↔255) on start, stop, amp changes, CW↔CCW, and Z↔X
+- Soft current limits (`limit`); boot-on all coils at ~2 A; over-limit derates `amp_live`
 - Dual CLI ports: human Serial Monitor + machine ESP32 bridge (`ping` / `json`)
 - Lab web UI tabs: **Field**, **DC coils**, **Logs** (sticky **ALL OFF**)
 - Onboard **0.96" ST7735** status UI
@@ -45,14 +54,12 @@ PlatformIO firmware for driving soft-magnetic coils with a **WeAct Mini STM32H74
 
 ### Coil / BTS7960 pin map (STM32)
 
-| Coil | RPWM | LPWM | EN | IS (ADC) | Timer |
-|------|------|------|-----|----------|-------|
-| M1 | PD14 | PD15 | PD10 | PA0 | TIM4 |
-| M2 | PE5 | PE6 | PE4 | PA1 | TIM15 |
-| M3 | PC6 | PC7 | PC5 | PA2 | TIM8 |
-| M4 | PC8 | PC9 | PC4 | PA3 | TIM8 |
-| M5 | PA6 | PA7 | PB10 | PA4 | TIM3 |
-| M6 | PB0 | PB1 | PB11 | PA5 | TIM3 |
+| Coil | Place | RPWM | LPWM | EN | IS (ADC) | Timer |
+|------|-------|------|------|-----|----------|-------|
+| M1 | X+ 0° | PD14 | PD15 | PD10 | PA0 | TIM4 |
+| M2 | Y+ 90° | PE5 | PE6 | PE4 | PA1 | TIM15 |
+| M3 | X− 180° | PC6 | PC7 | PC5 | PA2 | TIM8 |
+| M4 | Y− 270° | PC8 | PC9 | PC4 | PA3 | TIM8 |
 
 M1/M2 were remapped off PE10–PE14 so the WeAct onboard TFT can use SPI4.
 
@@ -68,7 +75,7 @@ IBT-2 / BTS7960: tie **R_EN + L_EN** to EN, logic **VCC = 5 V**, **VS** = coil s
 | DC | PE13 |
 | BL (active low) | PE10 |
 
-Shows mode/contour or `ROT fHz Aamp` while rotating (**live** amplitude after soft-limit derate), plus one status row per coil (~10 Hz).
+Shows mode/contour or `Z fHz Aamp` / `X fHz Aamp` while rotating (**live** amplitude and **live** axis), plus one status row per coil (~10 Hz).
 
 ### ESP32 ↔ STM32 bridge (3.3 V, common GND)
 
@@ -92,7 +99,7 @@ pio run -t upload
 pio device monitor   # 115200
 ```
 
-Board env: `weact_mini_h743vitx` (STM32Cube). Useful `build_flags` in `platformio.ini`: `NUM_COILS`, `PWM_TARGET_HZ`, `HSE_VALUE`.
+Board env: `weact_mini_h743vitx` (STM32Cube). Useful `build_flags` in `platformio.ini`: `PWM_TARGET_HZ`, `HSE_VALUE`. Optional `-DROTATE_RAMP_STEP=N` (live-amp LSB per 200 Hz tick; default `1` ≈ 1.3 s for 0↔255). `NUM_COILS` must stay **4**.
 
 ### ESP32-S3 bridge
 
@@ -100,22 +107,22 @@ Board env: `weact_mini_h743vitx` (STM32Cube). Useful `build_flags` in `platformi
 pio run -d esp32_bridge -t upload
 ```
 
-WiFi SSID/password and UART pins: `esp32_bridge/include/config.h`.
+WiFi SSID/password and UART pins: `esp32_bridge/include/config.h` (`NUM_COILS` is also 4 there).
 
 ## Web UI
 
 1. Join SoftAP **`CoilControl`** / **`coilcontrol`**
 2. Open **http://192.168.4.1/**
 3. Tabs:
-   - **Field** — start/stop rotating field, shared freq/amp, CW/CCW, soft limit. Waveform/status strip follow **live** amp when the field is derated.
-   - **DC coils** — per-coil constant drive. M1–M4 and **contour / program** lock while rotate is on (STOP first).
+   - **Field** — Z vs X axis, START/STOP, freq/amp, CW/CCW, soft limit. Waveform follows **live** amp, dir, and axis (X plot: M1/M3 flat, M2∥M4 identical).
+   - **DC coils** — per-coil constant drive, contour, program P1/P2. All four lock while rotate is on (STOP first).
    - **Logs** — command traffic + raw CLI
-4. Sticky **ALL OFF** in the header (`rotate off` then `off all`)
+4. Field **STOP** sends `rotate off` (amp fades). Header **ALL OFF** sends `rotate off` then `off all` — **`off all` cuts immediately**.
 5. Link pill is **linked** only after a parsed `json` coil snapshot. Ping-only shows **UART up · status stale**.
 
 ## Serial CLI (STM32)
 
-Both USART1 and USART3 accept the same commands (`help` for the full list). Examples:
+Both USART1 and USART3 accept the same commands (`help` for the full list). Motors are **M1–M4** only. Incomplete lines print usage; unknown motor tokens print an error. Examples:
 
 ```text
 help
@@ -132,6 +139,8 @@ drive M2 200 -
 limit all 255
 contour on|off
 program P1|P2|stop
+axis z
+axis x
 rotate on|off
 freq 5
 amp 180
@@ -140,18 +149,33 @@ rot_dir cw|ccw
 
 ### Rotating field
 
+**Z (in-plane, all four coils):**
+
 ```text
+axis z
 freq 2.5
 amp 160
 rot_dir cw
 rotate on
-...
-rotate off
 ```
 
-DC writes to M1–M4 (or CLI `contour` / `program`) automatically stop rotate and return those coils to safe DC control. `off all` / `program stop` also stop rotate and clear contour. **`rotate off` alone** disables M1–M4 and clears the contour flag.
+**X (M2∥M4 in-phase, M1/M3 idle, torque about X):**
 
-`status` / `json` report commanded `amp` and soft-clamped `amp_live`. Incomplete CLI lines print usage; unknown motor tokens print an error.
+```text
+axis x
+freq 2.5
+amp 160
+rot_dir cw
+rotate on
+```
+
+You can change `axis` / `rot_dir` / `amp` while rotating; the live field fades through 0 before the new setpoint.
+
+**Ramps** (`rotate off`, START, amp, CW↔CCW, Z↔X): live amplitude steps toward the target (~1.3 s 0↔255).
+
+**Immediate cuts:** `off all`, web **ALL OFF**, DC writes to M1–M4, `contour`, `program` (including `program stop`).
+
+`status` reports commanded `axis` / `rot_dir`, plus `amp` and `amp_live`. `json` also reports `axis_live` and `rot_dir_live` (what the sine ISR is using during a fade).
 
 ## Project layout
 

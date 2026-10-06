@@ -51,6 +51,7 @@ void DisplayUI_Init(void)
 
 void DisplayUI_Update(const char *mode, uint8_t contour,
                       uint8_t rotate, float freq_hz, uint8_t amp,
+                      uint8_t axis_x,
                       const DisplayCoilSnap *coils, int n)
 {
   if (!s_inited || !coils) return;
@@ -59,7 +60,8 @@ void DisplayUI_Update(const char *mode, uint8_t contour,
 
   char hdr[28];
   if (rotate) {
-    snprintf(hdr, sizeof(hdr), "ROT %.1fHz A%u", (double)freq_hz, (unsigned)amp);
+    snprintf(hdr, sizeof(hdr), "%c %.1fHz A%u", axis_x ? 'X' : 'Z',
+             (double)freq_hz, (unsigned)amp);
   } else {
     snprintf(hdr, sizeof(hdr), "%-6s c:%u", mode ? mode : "?", (unsigned)contour);
   }
