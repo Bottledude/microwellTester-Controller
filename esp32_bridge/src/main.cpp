@@ -53,7 +53,8 @@ static String stm32TransactionOnce(const String &cmd, uint32_t timeout_ms)
   StmSerial.flush();
 
   const bool wantJson = (cmd.indexOf("json") >= 0);
-  const uint32_t idle_ms = wantJson ? 250U : 120U;
+  const bool mlxCal = (cmd.indexOf("mlx cal") >= 0);
+  const uint32_t idle_ms = wantJson ? 250U : (mlxCal ? 500U : 120U);
 
   String acc;
   uint32_t start = millis();
@@ -201,7 +202,8 @@ static void handleCmd()
 
   String cmd = body["cmd"].as<String>();
   cmd.trim();
-  String raw = stm32Transaction(cmd);
+  uint32_t to = STM32_CMD_TIMEOUT_MS;
+  String raw = stm32Transaction(cmd, to);
   int score = asciiScore(raw);
 
   JsonDocument resp;

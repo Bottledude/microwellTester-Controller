@@ -19,11 +19,18 @@ typedef struct {
   float   i_limit_a;
 } DisplayCoilSnap;
 
+typedef struct {
+  uint8_t present;
+  uint8_t sat;
+  float   bx_mt, by_mt, bz_mt, babs_mt;
+} DisplayMlxSnap;
+
 void DisplayUI_Init(void);
 void DisplayUI_Update(const char *mode, uint8_t contour,
                       uint8_t rotate, float freq_hz, uint8_t amp,
-                      uint8_t axis_x,
-                      const DisplayCoilSnap *coils, int n);
+                      const char *field_tag, /* "rotY", "revX", or "revZ" */
+                      const DisplayCoilSnap *coils, int n,
+                      const DisplayMlxSnap *mlx);
 
 #ifdef __cplusplus
 }

@@ -51,17 +51,28 @@ void DisplayUI_Init(void)
 
 void DisplayUI_Update(const char *mode, uint8_t contour,
                       uint8_t rotate, float freq_hz, uint8_t amp,
-                      uint8_t axis_x,
-                      const DisplayCoilSnap *coils, int n)
+                      const char *field_tag,
+                      const DisplayCoilSnap *coils, int n,
+                      const DisplayMlxSnap *mlx)
 {
   if (!s_inited || !coils) return;
-  if (n > MAX_ROWS) n = MAX_ROWS;
   if (n < 0) n = 0;
+  if (n > MAX_ROWS - 1) n = MAX_ROWS - 1; /* leave a row for measured B */
 
   char hdr[28];
   if (rotate) {
-    snprintf(hdr, sizeof(hdr), "%c %.1fHz A%u", axis_x ? 'X' : 'Z',
-             (double)freq_hz, (unsigned)amp);
+    if (mlx && mlx->present) {
+      snprintf(hdr, sizeof(hdr), "%s %.2fHz %.1fmT",
+               (field_tag && field_tag[0]) ? field_tag : "fld",
+               (double)freq_hz, (double)mlx->babs_mt);
+    } else {
+      snprintf(hdr, sizeof(hdr), "%s %.1fHz A%u",
+               (field_tag && field_tag[0]) ? field_tag : "fld",
+               (double)freq_hz, (unsigned)amp);
+    }
+  } else if (mlx && mlx->present) {
+    snprintf(hdr, sizeof(hdr), "%-4s |B|%.1fmT",
+             mode ? mode : "?", (double)mlx->babs_mt);
   } else {
     snprintf(hdr, sizeof(hdr), "%-6s c:%u", mode ? mode : "?", (unsigned)contour);
   }
@@ -71,13 +82,16 @@ void DisplayUI_Update(const char *mode, uint8_t contour,
     draw_header(s_header);
   }
 
-  /* Clear leftover rows if coil count shrank */
-  for (int i = n; i < s_nrows; i++) {
-    uint16_t y = (uint16_t)(ROW0_Y + i * ROW_H);
-    ST7735_FillRect(0, y, ST7735_WIDTH, ROW_H - 1, ST7735_BLACK);
-    s_rows[i].line[0] = '\0';
+  /* Coil rows + one measured-B row. */
+  {
+    int total = n + 1;
+    if (total > MAX_ROWS) total = MAX_ROWS;
+    for (int i = total; i < s_nrows; i++) {
+      uint16_t y = (uint16_t)(ROW0_Y + i * ROW_H);
+      ST7735_FillRect(0, y, ST7735_WIDTH, ROW_H - 1, ST7735_BLACK);
+      s_rows[i].line[0] = '\0';
+    }
   }
-  s_nrows = n;
 
   for (int i = 0; i < n; i++) {
     const DisplayCoilSnap *c = &coils[i];
@@ -104,5 +118,28 @@ void DisplayUI_Update(const char *mode, uint8_t contour,
       s_rows[i].fg = fg;
       draw_row(i, line, fg);
     }
+  }
+
+  /* Extra row: measured lab B in mT (offset-subtracted). */
+  {
+    char line[28];
+    uint16_t fg;
+    int i = n;
+    if (mlx && mlx->present) {
+      snprintf(line, sizeof(line), "B%+.1f%+.1f%+.1f%s",
+               (double)mlx->bx_mt, (double)mlx->by_mt, (double)mlx->bz_mt,
+               mlx->sat ? "!" : " ");
+      fg = mlx->sat ? ST7735_ORANGE : ST7735_GRAY;
+    } else {
+      snprintf(line, sizeof(line), "mlx --");
+      fg = ST7735_GRAY;
+    }
+    if (i < MAX_ROWS && (strcmp(line, s_rows[i].line) != 0 || fg != s_rows[i].fg)) {
+      strncpy(s_rows[i].line, line, sizeof(s_rows[i].line) - 1);
+      s_rows[i].line[sizeof(s_rows[i].line) - 1] = '\0';
+      s_rows[i].fg = fg;
+      draw_row(i, line, fg);
+    }
+    if (s_nrows < i + 1) s_nrows = i + 1;
   }
 }
