@@ -2,7 +2,7 @@
 
 PlatformIO firmware for driving **four** soft-magnetic coils with a **WeAct Mini STM32H743VIT6**, a **PCA9685** PWM expander, and **BTS7960 / IBT-2** half-bridge drivers. An optional **ESP32-S3 N16R8** provides a WiFi SoftAP and lab-oriented browser UI while the STM32 Serial Monitor CLI remains available in parallel.
 
-**Repo:** https://github.com/Bottledude/softMagneticComposite-Controller
+**Repo:** https://github.com/Bottledude/microwellTester-Controller
 
 This firmware is **four coils only** (M1–M4). PWM goes out the PCA9685; **EN and IS stay on the STM32**. Flash **both** the STM32 and the ESP32 after pulling this tree.
 
@@ -141,7 +141,7 @@ Requires [PlatformIO](https://platformio.org/) (prefer `~/.platformio/penv/bin/p
 ### STM32H743
 
 ```bash
-cd /path/to/softMagneticComposite-Controller
+cd /path/to/microwellTester-Controller
 pio run -t upload
 pio device monitor   # 115200
 ```
