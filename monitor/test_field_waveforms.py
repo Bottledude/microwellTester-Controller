@@ -134,6 +134,132 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
+C = SQRT2_2
+
+
+def tilt_sincos_gamma(deg: float) -> tuple[float, float]:
+    if deg <= 0.0:
+        return 0.0, 1.0
+    if deg >= 90.0:
+        return 1.0, 0.0
+    r = math.radians(deg)
+    return math.sin(r), math.cos(r)
+
+
+def tilt_synthesize(H: float, V: float, sg: float, cg: float) -> tuple[float, float, float, float]:
+    hv = 0.5 * V
+    return (
+        C * (hv - H * cg),
+        C * (hv + H * sg),
+        C * (-hv - H * cg),
+        C * (-hv + H * sg),
+    )
+
+
+def tilt_shared_scale(ah: float, av: float, sg: float, cg: float, umax: float = 255.0) -> float:
+    half_v = 0.5 * av
+    p13 = C * math.sqrt(half_v * half_v + (ah * cg) ** 2)
+    p24 = C * math.sqrt(half_v * half_v + (ah * sg) ** 2)
+    pmax = max(p13, p24)
+    if pmax <= umax:
+        return 1.0
+    return umax / pmax
+
+
+def tilt_commands_exact(ah: float, av: float, sin_th: float, cos_th: float,
+                        sg: float, cg: float, umax: float = 255.0):
+    s = tilt_shared_scale(ah, av, sg, cg, umax)
+    raw = tilt_synthesize((ah * s) * cos_th, (av * s) * sin_th, sg, cg)
+    return raw, s
+
+
+def tilt_commands_lut(phase: int, amp_h: int, amp_v: int, ccw: bool,
+                      sg: float, cg: float) -> tuple[tuple[int, int, int, int], float]:
+    """Match firmware revolve_tilt_currents() (LUT sin/cos, shared scale, signed round)."""
+    ph = phase & 0xFFFFFFFF
+    if ccw:
+        ph = (-ph) & 0xFFFFFFFF
+    si = lut_from_phase(ph)
+    s = lut_unit(si)
+    c = lut_unit(si + LUT_90)
+    raw, scale = tilt_commands_exact(float(amp_h), float(amp_v), s, c, sg, cg, 255.0)
+    return (clamp_pwm(raw[0]), clamp_pwm(raw[1]), clamp_pwm(raw[2]), clamp_pwm(raw[3])), scale
+
+
+def check_tilt_mode() -> None:
+    A = 100.0
+    tol = 1e-4
+    sg, cg = tilt_sincos_gamma(0.0)
+    raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
+    if any(abs(a - b) > tol for a, b in zip(raw, (-70.710678, 0.0, -70.710678, 0.0))):
+        fail(f"python gamma=0 theta=0 commands {raw}")
+    bx, by, bz, _ = lab_b_from_coils(*raw)
+    if abs(bx) > tol or abs(by) > tol or abs(bz - 100.0) > tol:
+        fail(f"python gamma=0 theta=0 field {bx},{by},{bz}")
+
+    sg, cg = tilt_sincos_gamma(45.0)
+    raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
+    if any(abs(a - b) > tol for a, b in zip(raw, (-50.0, 50.0, -50.0, 50.0))):
+        fail(f"python gamma=45 theta=0 commands {raw}")
+    bx, by, bz, _ = lab_b_from_coils(*raw)
+    if abs(bx + 70.710678) > 1e-3 or abs(by) > tol or abs(bz - 70.710678) > 1e-3:
+        fail(f"python gamma=45 theta=0 field {bx},{by},{bz}")
+
+    sg, cg = tilt_sincos_gamma(90.0)
+    raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
+    if any(abs(a - b) > tol for a, b in zip(raw, (0.0, 70.710678, 0.0, 70.710678))):
+        fail(f"python gamma=90 theta=0 commands {raw}")
+    bx, by, bz, _ = lab_b_from_coils(*raw)
+    if abs(bx + 100.0) > tol or abs(by) > tol or abs(bz) > tol:
+        fail(f"python gamma=90 theta=0 field {bx},{by},{bz}")
+
+    for deg in (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0):
+        sg, cg = tilt_sincos_gamma(deg)
+        raw, _ = tilt_commands_exact(A, A, 1.0, 0.0, sg, cg)
+        if any(abs(a - b) > 1e-4 for a, b in zip(raw, (35.355339, 35.355339, -35.355339, -35.355339))):
+            fail(f"python theta=90 commands at gamma={deg}: {raw}")
+        for si in range(0, N, 5):
+            ph = (si << 32) // N
+            cmd, _ = tilt_commands_lut(ph, 100, 100, False, sg, cg)
+            bx, by, bz, babs = lab_b_from_coils(*cmd)
+            bn = bx * cg + bz * sg
+            if abs(bn) > 2.0:
+                fail(f"LUT Bn={bn} at gamma={deg} si={si}")
+            if abs(babs - 100.0) > 3.0:
+                fail(f"LUT |B|={babs} at gamma={deg} si={si}")
+            cmd_ccw, _ = tilt_commands_lut(ph, 100, 100, True, sg, cg)
+            bx2, by2, bz2, babs2 = lab_b_from_coils(*cmd_ccw)
+            if abs(bx2 * cg + bz2 * sg) > 2.0:
+                fail("CCW left the tilt plane")
+            if abs(babs2 - babs) > 3.0:
+                fail("CCW changed |B|")
+
+    # Reverse phase is not a no-op at a non-cardinal.
+    sg, cg = tilt_sincos_gamma(60.0)
+    cw, _ = tilt_commands_lut(0x10000000, 80, 80, False, sg, cg)
+    ccw, _ = tilt_commands_lut(0x10000000, 80, 80, True, sg, cg)
+    if cw == ccw:
+        fail("CW and CCW commands identical at mid-quadrant")
+
+    zcmd, _ = tilt_commands_lut(0, 0, 0, False, *tilt_sincos_gamma(45.0))
+    if zcmd != (0, 0, 0, 0):
+        fail(f"zero amp LUT commands {zcmd}")
+
+    # Shared scale keeps coils in range when rev_hv would overflow.
+    sg, cg = tilt_sincos_gamma(0.0)
+    sc = tilt_shared_scale(510.0, 510.0, sg, cg, 255.0)
+    if sc >= 1.0:
+        fail("expected shared scale < 1 for Ah=Av=510")
+    raw, _ = tilt_commands_exact(510.0, 510.0, 0.0, 1.0, sg, cg, 255.0)
+    if max(abs(v) for v in raw) > 255.0 + 1e-4:
+        fail("shared scale left a coil above Umax")
+
+    # Legacy revolve X/Z still two-coil; tilt gamma=0 uses all four.
+    i1, i2 = revolve_pair(0, 100, False)
+    if tilt_commands_lut(0, 100, 100, False, *tilt_sincos_gamma(0.0))[0] == (i1, 0, i2, 0):
+        fail("tilt gamma=0 should not match legacy two-coil revolve X commands")
+
+
 def envelope_amp(live: int, peak: int) -> int:
     """Match firmware revolve_envelope_amp()."""
     if peak == 0:
@@ -297,6 +423,9 @@ def main() -> int:
 
     print("ok: rotate Y pairing + lab B, constant-|B| revolve corners + Q0.5 + CCW")
     print("ok: rev_hv Ah/Av ellipse (H 4x smaller at Q0 vs Q1)")
+
+    check_tilt_mode()
+    print("ok: tilted-axis revolve LUT path + reference vectors + Bn=0")
     return 0
 
 

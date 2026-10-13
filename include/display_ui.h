@@ -28,7 +28,7 @@ typedef struct {
 void DisplayUI_Init(void);
 void DisplayUI_Update(const char *mode, uint8_t contour,
                       uint8_t rotate, float freq_hz, uint8_t amp,
-                      const char *field_tag, /* "rotY", "revX", or "revZ" */
+                      const char *field_tag, /* "rotY", "revX", "revZ", or "tilt" */
                       const DisplayCoilSnap *coils, int n,
                       const DisplayMlxSnap *mlx);
 

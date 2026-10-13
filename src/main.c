@@ -16,6 +16,8 @@
  *   Revolve Z — field in the XY plane. Only M2=I1, M4=I2
  *               (Ah=amp*h/100, Av=amp*v/100; 100/100 → constant |B|=amp).
  *   Revolve X — field in the YZ plane. Only M1=I1, M3=I2 (same Ah/Av ellipse).
+ *   Revolve tilt — field about a fixed XZ-plane axis n=(cos γ, 0, sin γ).
+ *               All four coils. Equal vertical split; see field_tilt.c.
  *
  * Shared freq (0.01–50 Hz) + amp; TIM6 sine ISR; amp ramps ~1.3 s.
  * PWM carrier is a PCA9685 (~1 kHz, 12-bit) over I2C — not STM32 timers.
@@ -53,6 +55,7 @@
 #include "st7735.h"
 #include "display_ui.h"
 #include "mlx90393.h"
+#include "field_tilt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,6 +117,9 @@ static int str_ieq(const char *a, const char *b)
 #endif
 #define REVOLVE_HV_PCT_MIN      1u
 #define REVOLVE_HV_PCT_MAX      200u
+#ifndef TILT_GAMMA_DEFAULT_DEG
+#define TILT_GAMMA_DEFAULT_DEG  45.0f
+#endif
 /* Soft OC must persist this many 200 Hz ticks before amp derate. */
 #ifndef ROTATE_OC_HYST_TICKS
 #define ROTATE_OC_HYST_TICKS    3u
@@ -162,9 +168,10 @@ typedef enum {
 } RotateDir;
 
 typedef enum {
-  FIELD_ROTATE_Y = 0,  /* XZ plane; M1=M3 cos, M2=M4 sin */
-  FIELD_REVOLVE_X = 1, /* YZ plane; M1=I1, M3=I2 */
-  FIELD_REVOLVE_Z = 2  /* XY plane; M2=I1, M4=I2 */
+  FIELD_ROTATE_Y = 0,     /* XZ plane; M1=M3 cos, M2=M4 sin */
+  FIELD_REVOLVE_X = 1,    /* YZ plane; M1=I1, M3=I2 */
+  FIELD_REVOLVE_Z = 2,    /* XY plane; M2=I1, M4=I2 */
+  FIELD_REVOLVE_TILT = 3  /* fixed XZ-tilt axis; all four coils */
 } FieldProgram;
 
 typedef struct {
@@ -234,6 +241,11 @@ static FieldProgram      g_field_prog = FIELD_ROTATE_Y;
 static FieldProgram      g_field_prog_want = FIELD_ROTATE_Y;
 static uint8_t           g_revolve_h_pct = (uint8_t)REVOLVE_H_PCT_DEFAULT;
 static uint8_t           g_revolve_v_pct = (uint8_t)REVOLVE_V_PCT_DEFAULT;
+static float             g_tilt_gamma_want = TILT_GAMMA_DEFAULT_DEG;
+static volatile float    g_tilt_gamma_live = TILT_GAMMA_DEFAULT_DEG;
+static volatile float    g_tilt_sin_g = FIELD_TILT_C; /* sin/cos 45° */
+static volatile float    g_tilt_cos_g = FIELD_TILT_C;
+static volatile float    g_tilt_scale = 1.0f;
 static volatile uint8_t  g_rotate_stop_pending;
 static volatile uint32_t g_phase;
 static volatile uint32_t g_phase_inc;
@@ -353,6 +365,8 @@ static void Field_Start(FieldProgram p);
 static void Rotate_SetDir(RotateDir d);
 static void Field_SetProgram(FieldProgram p);
 static void Field_ApplyOptionalFreqAmp(int argc, char **argv, int start);
+static void Tilt_CommitGamma(float deg);
+static void Tilt_SetGamma(float deg);
 static void Revolve_ClearPark(void);
 static void Revolve_GotoCorner(uint8_t q);
 static void Rotate_StopIfDcConflict(uint8_t idx);
@@ -545,6 +559,25 @@ static void Teleplot_Emit(void)
   uart_write(line);
   snprintf(line, sizeof(line), ">Babs:%.2f\n", (double)babs);
   uart_write(line);
+  {
+    float sg = g_tilt_sin_g;
+    float cg = g_tilt_cos_g;
+    float gdeg = g_tilt_gamma_live;
+    float scale = g_tilt_scale;
+    float bh = -bx * sg + bz * cg;
+    float bv = by;
+    float bn = bx * cg + bz * sg;
+    snprintf(line, sizeof(line), ">gamma:%.2f\n", (double)gdeg);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Bh:%.2f\n", (double)bh);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Bv:%.2f\n", (double)bv);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Bn:%.2f\n", (double)bn);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">tilt_scale:%.4f\n", (double)scale);
+    uart_write(line);
+  }
   snprintf(line, sizeof(line), ">Bxy:%.2f:%.2f|xy\n", (double)bx, (double)by);
   uart_write(line);
   snprintf(line, sizeof(line), ">Bxz:%.2f:%.2f|xy\n", (double)bz, (double)bx);
@@ -879,7 +912,8 @@ static void PCA9685_Flush(void)
       if (r[1] || l[1] || r[3] || l[3]) g_dbg_pair_mis++;
     } else if (prog == FIELD_REVOLVE_Z) {
       if (r[0] || l[0] || r[2] || l[2]) g_dbg_pair_mis++;
-    } else if (r[0] != r[2] || l[0] != l[2] || r[1] != r[3] || l[1] != l[3]) {
+    } else if (prog != FIELD_REVOLVE_TILT &&
+               (r[0] != r[2] || l[0] != l[2] || r[1] != r[3] || l[1] != l[3])) {
       g_dbg_pair_mis++;
     }
     /* #endregion */
@@ -889,6 +923,8 @@ static void PCA9685_Flush(void)
     } else if (prog == FIELD_REVOLVE_Z) {
       /* M2 and M4 are independent (I1 vs I2); M1/M3 off. */
       r[0] = l[0] = r[2] = l[2] = 0;
+    } else if (prog == FIELD_REVOLVE_TILT) {
+      /* All four coils independent — do not pair or zero. */
     } else {
       /* Rotate Y: opposite coils share the same signed current. */
       r[2] = r[0];
@@ -1033,6 +1069,7 @@ static void Display_PushStatus(void)
   const char *tag = "rotY";
   if (g_field_prog == FIELD_REVOLVE_X) tag = "revX";
   else if (g_field_prog == FIELD_REVOLVE_Z) tag = "revZ";
+  else if (g_field_prog == FIELD_REVOLVE_TILT) tag = "tilt";
   DisplayMlxSnap mlx;
   memset(&mlx, 0, sizeof(mlx));
   mlx.present = g_mlx.present;
@@ -1165,7 +1202,8 @@ static const char *rotate_dir_str(RotateDir d)
 
 static const char *field_program_str(FieldProgram p)
 {
-  if (p == FIELD_REVOLVE_X || p == FIELD_REVOLVE_Z) return "revolve";
+  if (p == FIELD_REVOLVE_X || p == FIELD_REVOLVE_Z || p == FIELD_REVOLVE_TILT)
+    return "revolve";
   return "rotate";
 }
 
@@ -1173,6 +1211,7 @@ static const char *field_axis_str(FieldProgram p)
 {
   if (p == FIELD_REVOLVE_X) return "x";
   if (p == FIELD_REVOLVE_Z) return "z";
+  if (p == FIELD_REVOLVE_TILT) return "tilt";
   return "y";
 }
 
@@ -1296,7 +1335,65 @@ static void revolve_pair_currents(uint32_t phase, uint8_t amp_h, uint8_t amp_v,
 
 static uint8_t field_is_revolve(FieldProgram p)
 {
-  return (p == FIELD_REVOLVE_X || p == FIELD_REVOLVE_Z) ? 1 : 0;
+  return (p == FIELD_REVOLVE_X || p == FIELD_REVOLVE_Z ||
+          p == FIELD_REVOLVE_TILT) ? 1 : 0;
+}
+
+static uint8_t field_is_tilt(FieldProgram p)
+{
+  return (p == FIELD_REVOLVE_TILT) ? 1 : 0;
+}
+
+static void Tilt_CommitGamma(float deg)
+{
+  FieldTiltCoeffs c;
+  field_tilt_coeffs_from_deg(deg, &c);
+  __disable_irq();
+  g_tilt_gamma_live = c.deg;
+  g_tilt_sin_g = c.sin_g;
+  g_tilt_cos_g = c.cos_g;
+  __enable_irq();
+}
+
+static void Tilt_SetGamma(float deg)
+{
+  g_tilt_gamma_want = deg;
+  /* Idle, or AC running in a non-tilt program: apply immediately. */
+  if (!g_rotate_active || !field_is_tilt(g_field_prog)) {
+    Tilt_CommitGamma(deg);
+  }
+}
+
+static float Tilt_PreviewScale(uint8_t amp)
+{
+  uint8_t ah = revolve_scaled_amp(amp, g_revolve_h_pct);
+  uint8_t av = revolve_scaled_amp(amp, g_revolve_v_pct);
+  float sg, cg;
+  field_tilt_gamma_sincos(g_tilt_gamma_want, &sg, &cg);
+  return field_tilt_shared_scale((float)ah, (float)av, sg, cg, (float)PWM_ARR);
+}
+
+/*
+ * Tilted-axis pair. Direction is applied once by negating phase (same as
+ * revolve_pair_currents). Do not also negate H/V or the gamma coefficients.
+ */
+static void revolve_tilt_currents(uint32_t phase, uint8_t amp_h, uint8_t amp_v,
+                                  RotateDir dir, float sin_g, float cos_g,
+                                  int16_t out[4], float *scale_out)
+{
+  uint32_t ph = phase;
+  uint16_t si;
+  float invs = 1.0f / 32767.0f;
+  float s, c, raw[4], scale;
+
+  if (dir == ROT_CCW) ph = 0u - ph;
+  si = lut_from_phase(ph);
+  s = (float)SINE_LUT[si] * invs;
+  c = (float)SINE_LUT[lut_add(si, (int16_t)SINE_LUT_90)] * invs;
+  field_tilt_commands((float)amp_h, (float)amp_v, s, c, sin_g, cos_g,
+                      (float)PWM_ARR, raw, &scale);
+  field_tilt_quantize(raw, out, (int16_t)PWM_ARR);
+  if (scale_out) *scale_out = scale;
 }
 
 static uint32_t revolve_corner_phase(uint8_t q, RotateDir dir)
@@ -1504,6 +1601,9 @@ static void Field_Start(FieldProgram p)
   g_rotate_amp_live = 0; /* fade in from zero */
   g_rotate_dir = g_rotate_dir_want;
   g_field_prog = g_field_prog_want;
+  if (field_is_tilt(g_field_prog)) {
+    Tilt_CommitGamma(g_tilt_gamma_want);
+  }
   g_revolve_phase_hold = field_is_revolve(g_field_prog) ? 1 : 0;
   g_revolve_env_peak = g_rotate_amp;
 
@@ -1524,6 +1624,10 @@ static void Rotate_RampUpdate(void)
 
   uint8_t prog_mismatch = (g_field_prog != g_field_prog_want);
   uint8_t dir_mismatch = (g_rotate_dir != g_rotate_dir_want);
+  uint8_t gamma_mismatch = 0;
+  if (field_is_tilt(g_field_prog) || field_is_tilt(g_field_prog_want)) {
+    gamma_mismatch = (g_tilt_gamma_live != g_tilt_gamma_want) ? 1 : 0;
+  }
 
   if ((dir_mismatch || prog_mismatch) && g_rotate_amp_live == 0 &&
       !g_rotate_stop_pending) {
@@ -1531,6 +1635,10 @@ static void Rotate_RampUpdate(void)
     g_field_prog = g_field_prog_want;
     dir_mismatch = 0;
     prog_mismatch = 0;
+    if (field_is_tilt(g_field_prog)) {
+      Tilt_CommitGamma(g_tilt_gamma_want);
+      gamma_mismatch = 0;
+    }
     if (field_is_revolve(g_field_prog)) {
       if (g_revolve_park) {
         g_phase = revolve_corner_phase(g_revolve_corner, g_rotate_dir);
@@ -1546,8 +1654,18 @@ static void Rotate_RampUpdate(void)
     }
   }
 
+  /* Gamma-only: ramp through 0, commit sin/cos together, keep phase. */
+  if (gamma_mismatch && g_rotate_amp_live == 0 && !g_rotate_stop_pending) {
+    Tilt_CommitGamma(g_tilt_gamma_want);
+    gamma_mismatch = 0;
+    if (field_is_revolve(g_field_prog)) {
+      g_revolve_phase_hold = 1;
+      g_revolve_env_peak = g_rotate_amp;
+    }
+  }
+
   uint8_t target = g_rotate_amp;
-  if (g_rotate_stop_pending || dir_mismatch || prog_mismatch) {
+  if (g_rotate_stop_pending || dir_mismatch || prog_mismatch || gamma_mismatch) {
     target = 0;
   }
 
@@ -1586,7 +1704,8 @@ static void Rotate_RampUpdate(void)
     uint8_t is_rev = field_is_revolve(g_field_prog);
     if (!is_rev) {
       g_revolve_phase_hold = 0;
-    } else if (g_rotate_stop_pending || dir_mismatch || prog_mismatch) {
+    } else if (g_rotate_stop_pending || dir_mismatch || prog_mismatch ||
+               gamma_mismatch) {
       if (!g_revolve_phase_hold) {
         g_revolve_env_peak = g_rotate_amp_live;
       }
@@ -1945,9 +2064,10 @@ static void CLI_PrintHelp(void)
     "limit <M#|all> <0..255>      soft current limit (255=~2A, 0=off)\r\n"
     "mode open|closed             open-loop duty vs IS closed-loop [DC]\r\n"
     "rotate on|off [Hz] [0..255]  Y-axis rotate in XZ (M1=M3 cos, M2=M4 sin)\r\n"
-    "revolve x|z [Hz] [0..255]    revolve around x (YZ, M1/M3) or z (XY, M2/M4)\r\n"
+    "revolve x|z|tilt [Hz] [amp]  x=YZ M1/M3; z=XY M2/M4; tilt=fixed XZ axis, all four\r\n"
     "revolve off                  stop AC field (same ramp as rotate off)\r\n"
-    "axis y|x|z                   select program without start (y=rotate, x/z=revolve)\r\n"
+    "axis y|x|z|tilt              select program without start (y=rotate, x/z/tilt=revolve)\r\n"
+    "gamma <0..90>                tilt-axis angle in deg from +X toward +Z (tilt mode)\r\n"
     "freq <Hz>                    AC field freq 0.01..50 Hz\r\n"
     "amp <0..255>                 shared AC amp (revolve: lab |B|; rotate Y: pair peak)\r\n"
     "rev_hv <h%> <v%>             Ah=amp*h/100 Av=amp*v/100 (100 100=circle; 25 100 cuts H 4x)\r\n"
@@ -1971,7 +2091,12 @@ static void CLI_PrintHelp(void)
     "rotate Y: all four, pairs same direction, 90 deg apart — field in XZ.\r\n"
     "revolve z: M2=I1, M4=I2; Ah/Av from rev_hv (equal=circle). Q0 uses Ah, Q1 uses Av.\r\n"
     "revolve x: M1=I1, M3=I2, same Ah/Av ellipse; M2,M4 off — field in YZ.\r\n"
-    "CW corners: Q0=+Bh, Q1=+Bv, Q2=-Bh, Q3=-Bv. 'corner Qn' parks there (sine travel).\r\n"
+    "revolve tilt: n=(cos g,0,sin g) in XZ; all four coils. gamma 0=+X (YZ plane), 90=+Z (XY).\r\n"
+    "  Endpoint fields match revolve X/Z planes; coil commands differ (equal-V split).\r\n"
+    "  Unequal rev_hv is an ellipse, not constant |B|. Shared scale if a coil would exceed 255.\r\n"
+    "  CW = +theta (omega = -n). CCW = -theta (omega = +n). Direction applied once.\r\n"
+    "  gamma=90 Q0 is -X (not legacy revolve-Z +X). Change gamma while running ramps through 0.\r\n"
+    "CW corners: Q0=+h/+Bh, Q1=+Y/+Bv, Q2=-h/-Bh, Q3=-Y/-Bv. 'corner Qn' parks there.\r\n"
     "Revolve start/stop: freeze phase, quarter-sine envelope on |A|, then step.\r\n"
     "Start/stop/CW↔CCW/program change fade live amp through 0 (~1.3 s 0↔255).\r\n"
     "AC field: driven-coil EN stays on through zero; PCA flush continues during json/status.\r\n"
@@ -1999,8 +2124,14 @@ static void CLI_PrintStatus(void)
               (unsigned)g_rotate_amp,
               (unsigned)g_rotate_amp_live,
               rotate_dir_str(g_rotate_dir_want));
-  uart_printf("rev_hv h=%u%% v=%u%%  (Ah=amp*h/100, Av=amp*v/100)\r\n",
+  uart_printf("rev_hv h=%u%% v=%u%%  (Ah=amp*h/100, Av=amp*v/100; unequal = ellipse)\r\n",
               (unsigned)g_revolve_h_pct, (unsigned)g_revolve_v_pct);
+  {
+    float sc = Tilt_PreviewScale(g_rotate_amp);
+    uart_printf("gamma=%.2f deg (live=%.2f)  tilt_scale=%.4f%s\r\n",
+                (double)g_tilt_gamma_want, (double)g_tilt_gamma_live,
+                (double)sc, sc < 1.0f ? " (limited)" : "");
+  }
   if (g_revolve_park) {
     uart_printf("corner=Q%u%s\r\n", (unsigned)g_revolve_corner,
                 g_revolve_travel ? " (traveling)" : " (parked)");
@@ -2084,6 +2215,7 @@ static void CLI_HandleLine(char *line)
                      "\"axis\":\"%s\",\"axis_live\":\"%s\","
                      "\"freq\":%.2f,\"amp\":%u,\"amp_live\":%u,"
                      "\"rev_h\":%u,\"rev_v\":%u,"
+                     "\"gamma\":%.2f,\"gamma_live\":%.2f,\"tilt_scale\":%.4f,"
                      "\"rot_dir\":\"%s\",\"rot_dir_live\":\"%s\",\"n\":%d,"
                      "\"corner\":%d,\"park\":%u,\"travel\":%u,"
                      "\"signed\":[%d,%d,%d,%d],"
@@ -2100,6 +2232,9 @@ static void CLI_HandleLine(char *line)
                      (unsigned)g_rotate_amp_live,
                      (unsigned)g_revolve_h_pct,
                      (unsigned)g_revolve_v_pct,
+                     (double)g_tilt_gamma_want,
+                     (double)g_tilt_gamma_live,
+                     (double)g_tilt_scale,
                      rotate_dir_str(g_rotate_dir_want),
                      rotate_dir_str(g_rotate_dir),
                      NUM_COILS,
@@ -2353,7 +2488,7 @@ static void CLI_HandleLine(char *line)
     return;
   }
   if (!strcmp(cmd, "revolve")) {
-    if (argc < 2) { uart_write("usage: revolve x|z [Hz] [0..255]  |  revolve off\r\n"); return; }
+    if (argc < 2) { uart_write("usage: revolve x|z|tilt [Hz] [0..255]  |  revolve off\r\n"); return; }
     if (str_ieq(argv[1], "off")) {
       Rotate_RequestStop();
       uart_write("revolve OFF (ramping)\r\n");
@@ -2367,17 +2502,29 @@ static void CLI_HandleLine(char *line)
       rp = FIELD_REVOLVE_X;
     } else if (str_ieq(argv[1], "z") || str_ieq(argv[1], "xy")) {
       rp = FIELD_REVOLVE_Z;
+    } else if (str_ieq(argv[1], "tilt") || str_ieq(argv[1], "tilted") ||
+               str_ieq(argv[1], "n")) {
+      rp = FIELD_REVOLVE_TILT;
     } else {
-      uart_write("usage: revolve x|z [Hz] [0..255]  |  revolve off\r\n");
+      uart_write("usage: revolve x|z|tilt [Hz] [0..255]  |  revolve off\r\n");
       return;
     }
     Field_ApplyOptionalFreqAmp(argc, argv, 2);
     Revolve_ClearPark();
     Field_Start(rp);
-    uart_printf("revolve ON axis=%s freq=%.2f amp=%u dir=%s (ramping)\r\n",
-                field_axis_str(g_field_prog_want),
-                (double)g_rotate_freq_hz, (unsigned)g_rotate_amp,
-                rotate_dir_str(g_rotate_dir_want));
+    if (rp == FIELD_REVOLVE_TILT) {
+      float sc = Tilt_PreviewScale(g_rotate_amp);
+      uart_printf("revolve ON axis=tilt gamma=%.2f freq=%.2f amp=%u dir=%s scale=%.4f%s (ramping)\r\n",
+                  (double)g_tilt_gamma_want,
+                  (double)g_rotate_freq_hz, (unsigned)g_rotate_amp,
+                  rotate_dir_str(g_rotate_dir_want),
+                  (double)sc, sc < 1.0f ? " limited" : "");
+    } else {
+      uart_printf("revolve ON axis=%s freq=%.2f amp=%u dir=%s (ramping)\r\n",
+                  field_axis_str(g_field_prog_want),
+                  (double)g_rotate_freq_hz, (unsigned)g_rotate_amp,
+                  rotate_dir_str(g_rotate_dir_want));
+    }
     /* #region agent log */
     dbg_print_snapshot("revolve_on");
     /* #endregion */
@@ -2450,8 +2597,36 @@ static void CLI_HandleLine(char *line)
     }
     g_revolve_h_pct = clamp_u8_pct(atoi(argv[1]));
     g_revolve_v_pct = clamp_u8_pct(atoi(argv[2]));
-    uart_printf("rev_hv h=%u%% v=%u%%\r\n",
-                (unsigned)g_revolve_h_pct, (unsigned)g_revolve_v_pct);
+    {
+      float sc = Tilt_PreviewScale(g_rotate_amp);
+      uart_printf("rev_hv h=%u%% v=%u%%%s\r\n",
+                  (unsigned)g_revolve_h_pct, (unsigned)g_revolve_v_pct,
+                  (sc < 1.0f && field_is_tilt(g_field_prog_want))
+                    ? "  (tilt shared-scale will limit)" : "");
+    }
+    return;
+  }
+  if (!strcmp(cmd, "gamma") || !strcmp(cmd, "tilt") || !strcmp(cmd, "tilt_gamma")) {
+    float g;
+    if (argc < 2) {
+      uart_printf("gamma=%.2f deg (live=%.2f)  range 0..90 from +X toward +Z\r\n",
+                  (double)g_tilt_gamma_want, (double)g_tilt_gamma_live);
+      return;
+    }
+    if (!field_tilt_parse_gamma(argv[1], &g)) {
+      uart_write("usage: gamma <0..90>   (degrees from +X toward +Z; no wrap)\r\n");
+      return;
+    }
+    Tilt_SetGamma(g);
+    {
+      float sc = Tilt_PreviewScale(g_rotate_amp);
+      uart_printf("gamma=%.2f deg%s%s\r\n",
+                  (double)g_tilt_gamma_want,
+                  (g_rotate_active && field_is_tilt(g_field_prog) &&
+                   g_tilt_gamma_live != g_tilt_gamma_want)
+                    ? " (ramping through 0)" : "",
+                  sc < 1.0f ? "  tilt_scale limited" : "");
+    }
     return;
   }
   if (!strcmp(cmd, "mlx")) {
@@ -2547,7 +2722,7 @@ static void CLI_HandleLine(char *line)
     return;
   }
   if (!strcmp(cmd, "axis") || !strcmp(cmd, "rot_axis")) {
-    if (argc < 2) { uart_write("usage: axis y|x|z\r\n"); return; }
+    if (argc < 2) { uart_write("usage: axis y|x|z|tilt\r\n"); return; }
     if (str_ieq(argv[1], "y") || str_ieq(argv[1], "xz") || str_ieq(argv[1], "rotate")
         || str_ieq(argv[1], "inplane")) {
       Field_SetProgram(FIELD_ROTATE_Y);
@@ -2558,8 +2733,13 @@ static void CLI_HandleLine(char *line)
     } else if (str_ieq(argv[1], "z") || str_ieq(argv[1], "xy")) {
       Field_SetProgram(FIELD_REVOLVE_Z);
       uart_write("axis=z program=revolve (XY, M2=I1 M4=I2)\r\n");
+    } else if (str_ieq(argv[1], "tilt") || str_ieq(argv[1], "tilted") ||
+               str_ieq(argv[1], "n")) {
+      Field_SetProgram(FIELD_REVOLVE_TILT);
+      uart_printf("axis=tilt program=revolve (n in XZ, gamma=%.2f deg, all four)\r\n",
+                  (double)g_tilt_gamma_want);
     } else {
-      uart_write("usage: axis y|x|z\r\n");
+      uart_write("usage: axis y|x|z|tilt\r\n");
     }
     return;
   }
@@ -2768,21 +2948,35 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   } else {
     uint8_t a_cmd = amp;
     uint8_t amp_h, amp_v;
-    int16_t i1, i2;
     if (hold) a_cmd = revolve_envelope_amp(amp, g_revolve_env_peak);
     amp_h = revolve_scaled_amp(a_cmd, g_revolve_h_pct);
     amp_v = revolve_scaled_amp(a_cmd, g_revolve_v_pct);
-    revolve_pair_currents(g_phase, amp_h, amp_v, g_rotate_dir, &i1, &i2);
-    if (prog == FIELD_REVOLVE_Z) {
-      Coil_ApplySignedDuty(0, 0);
-      Coil_ApplySignedDuty(2, 0);
-      Coil_ApplySignedDuty(1, i1); /* M2 = I1 */
-      Coil_ApplySignedDuty(3, i2); /* M4 = I2 */
+    if (prog == FIELD_REVOLVE_TILT) {
+      int16_t cmd[4];
+      float sg = g_tilt_sin_g;
+      float cg = g_tilt_cos_g;
+      float scale;
+      revolve_tilt_currents(g_phase, amp_h, amp_v, g_rotate_dir, sg, cg,
+                            cmd, &scale);
+      g_tilt_scale = scale;
+      Coil_ApplySignedDuty(0, cmd[0]);
+      Coil_ApplySignedDuty(1, cmd[1]);
+      Coil_ApplySignedDuty(2, cmd[2]);
+      Coil_ApplySignedDuty(3, cmd[3]);
     } else {
-      Coil_ApplySignedDuty(1, 0);
-      Coil_ApplySignedDuty(3, 0);
-      Coil_ApplySignedDuty(0, i1); /* M1 = I1 */
-      Coil_ApplySignedDuty(2, i2); /* M3 = I2 */
+      int16_t i1, i2;
+      revolve_pair_currents(g_phase, amp_h, amp_v, g_rotate_dir, &i1, &i2);
+      if (prog == FIELD_REVOLVE_Z) {
+        Coil_ApplySignedDuty(0, 0);
+        Coil_ApplySignedDuty(2, 0);
+        Coil_ApplySignedDuty(1, i1); /* M2 = I1 */
+        Coil_ApplySignedDuty(3, i2); /* M4 = I2 */
+      } else {
+        Coil_ApplySignedDuty(1, 0);
+        Coil_ApplySignedDuty(3, 0);
+        Coil_ApplySignedDuty(0, i1); /* M1 = I1 */
+        Coil_ApplySignedDuty(2, i2); /* M3 = I2 */
+      }
     }
   }
 }

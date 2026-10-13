@@ -133,6 +133,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
   input[type=range] { width: 100%; accent-color: var(--accent); }
   .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .seg.triple { grid-template-columns: 1fr 1fr 1fr; }
+  .seg.quad { grid-template-columns: 1fr 1fr; }
   .seg button.active { border-color: var(--accent); background: var(--accent-dim); color: #fff; }
   .switch { position: relative; width: 46px; height: 26px; }
   .switch input { opacity: 0; width: 0; height: 0; }
@@ -236,6 +237,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
   <span>freq <b id="stFreq">1.00</b> Hz</span>
   <span>amp <b id="stAmp">0</b></span>
   <span>H/V <b id="stHV">100/100</b></span>
+  <span>γ <b id="stGamma">45</b>°</span>
   <span>dir <b id="stDir">cw</b></span>
   <span>mode <b id="stMode">open</b></span>
   <span>I<sub>1</sub> <b id="stIA">—</b></span>
@@ -275,7 +277,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
     </div>
     <h2 class="section-title">Rotate / revolve</h2>
-    <p class="section-help">Y is vertical (out of plane); X and Z are horizontal. Coils at 90°, each tilted ~45°. <b>Rotate Y</b>: field in XZ — M1=M3 ∝ cos ωt, M2=M4 ∝ sin ωt (same current direction within each pair). <b>Revolve Z</b>: XY plane, M2=I₁ and M4=I₂. <code>rev_hv</code> sets A<sub>h</sub>/A<sub>v</sub> (100/100 = PWM circle; 25/100 cuts H 4×). The MLX90393 only displays measured B — it does not correct coil PWM. <b>Revolve X</b>: same on M1/M3 in YZ. ALL OFF still cuts immediately.</p>
+    <p class="section-help">Y is vertical (out of plane); X and Z are horizontal. Coils at 90°, each tilted ~45°. <b>Rotate Y</b>: field in XZ — M1=M3 ∝ cos ωt, M2=M4 ∝ sin ωt (same current direction within each pair). <b>Revolve Z</b>: XY plane, M2=I₁ and M4=I₂. <code>rev_hv</code> sets A<sub>h</sub>/A<sub>v</sub> (100/100 = PWM circle; 25/100 cuts H 4×; unequal = ellipse). The MLX90393 only displays measured B — it does not correct coil PWM. <b>Revolve X</b>: same on M1/M3 in YZ. <b>Revolve tilt</b>: field about a fixed XZ-plane axis n=(cos γ, 0, sin γ); all four coils. γ from +X toward +Z (0–90°). ALL OFF still cuts immediately.</p>
     <div class="cfg-grid">
       <div class="card">
         <h2>Run control</h2>
@@ -300,11 +302,12 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Field program</h2>
-        <p class="section-help">Rotate Y uses all four coils. Revolve X uses M1/M3 only. Revolve Z uses M2/M4 only.</p>
-        <div class="seg triple">
+        <p class="section-help">Rotate Y uses all four coils. Revolve X uses M1/M3 only. Revolve Z uses M2/M4 only. Revolve tilt uses all four about a fixed XZ axis.</p>
+        <div class="seg quad">
           <button type="button" id="progRotYBtn" class="active" onclick="setFieldProgram('rotate','y')">Rotate Y</button>
           <button type="button" id="progRevXBtn" onclick="setFieldProgram('revolve','x')">Revolve X</button>
           <button type="button" id="progRevZBtn" onclick="setFieldProgram('revolve','z')">Revolve Z</button>
+          <button type="button" id="progRevTiltBtn" onclick="setFieldProgram('revolve','tilt')">Revolve tilt</button>
         </div>
       </div>
 
@@ -325,7 +328,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Amplitude</h2>
-        <p class="section-help">Shared peak duty 0–255 (Bmax/μ scale). Rotate Y: all four. Revolve X: M1/M3. Revolve Z: M2/M4.</p>
+        <p class="section-help">Shared peak duty 0–255 (Bmax/μ scale). Rotate Y and revolve tilt: all four. Revolve X: M1/M3. Revolve Z: M2/M4.</p>
         <div class="field">
           <label for="ampVal">Amplitude <b id="ampLabel">0</b></label>
           <input id="ampVal" type="number" min="0" max="255" step="1" value="0"
@@ -339,7 +342,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Revolve A scale (H / V)</h2>
-        <p class="section-help">A<sub>h</sub>=amp·H/100, A<sub>v</sub>=amp·V/100. 100/100 is a PWM-proxy circle. If real H is 4× V, use <b>25 / 100</b> (do not boost V 4× — that saturates PWM). Rotate Y ignores this.</p>
+        <p class="section-help">A<sub>h</sub>=amp·H/100, A<sub>v</sub>=amp·V/100. 100/100 is a PWM-proxy circle. Unequal radii are an ellipse, not constant |B|. If real H is 4× V, use <b>25 / 100</b> (do not boost V 4× — that saturates PWM). Rotate Y ignores this. Tilt mode uses the same H/V and may shared-scale if a coil would exceed 255.</p>
         <div class="field">
           <label for="revHVal">Horizontal % <b id="revHLabel">100</b></label>
           <input id="revHVal" type="number" min="1" max="200" step="1" value="100"
@@ -361,6 +364,20 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
 
       <div class="card">
+        <h2>Tilt axis γ</h2>
+        <p class="section-help">Fixed rotation axis in the XZ plane, measured from +X toward +Z (0–90°). 0° = revolve-X plane (YZ); 90° = revolve-Z plane (XY) with Q0 at −X. Changing γ while running ramps through 0. Does not rotate the axis over time.</p>
+        <div class="field">
+          <label for="gammaVal">γ (deg) <b id="gammaLabel">45</b></label>
+          <input id="gammaVal" type="number" min="0" max="90" step="1" value="45"
+            oninput="onGammaInput(+this.value)"
+            onchange="applyGamma()"/>
+        </div>
+        <input type="range" id="gammaRange" min="0" max="90" value="45"
+          oninput="onGammaInput(+this.value)"
+          onchange="applyGamma()"/>
+      </div>
+
+      <div class="card">
         <h2>MLX90393 centre probe</h2>
         <p class="section-help">I2C2 PB10 SCL / PB11 SDA, 3.3 V, not on the PCA bus. Display only — measured B never changes coil PWM. Offset zeros Earth/bias with coils off.</p>
         <div class="kv">Chip: <b id="mlxPresent">—</b><br/>
@@ -374,7 +391,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Revolve corner</h2>
-        <p class="section-help">Park at a cardinal (sine-travel along the |B| circle). <b>Run</b> resumes revolving. Q0=+B<sub>h</sub>, Q1=+B<sub>v</sub>, Q2=−B<sub>h</sub>, Q3=−B<sub>v</sub>.</p>
+        <p class="section-help">Park at a cardinal (sine-travel along the |B| circle). <b>Run</b> resumes revolving. Q0=+B<sub>h</sub> (+h in tilt), Q1=+B<sub>v</sub> (+Y), Q2=−B<sub>h</sub>, Q3=−B<sub>v</sub>.</p>
         <div class="seg" style="grid-template-columns:repeat(5,1fr);max-width:520px">
           <button type="button" id="cornerQ0Btn" onclick="setCorner(0)">Q0</button>
           <button type="button" id="cornerQ1Btn" onclick="setCorner(1)">Q1</button>
@@ -387,7 +404,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Rotation direction</h2>
-        <p class="section-help">Rotate Y: CW = M2∥M4 = +sin, CCW = −sin. Revolve: CCW runs the circle backward (−ω).</p>
+        <p class="section-help">Rotate Y: CW = M2∥M4 = +sin, CCW = −sin. Revolve X/Z: CCW runs the circle backward (−ω). Tilt: CW = +θ (ω = −n); CCW = −θ (ω = +n).</p>
         <div class="seg">
           <button type="button" id="dirCwBtn" class="active" onclick="setRotDir('cw')">CW</button>
           <button type="button" id="dirCcwBtn" onclick="setRotDir('ccw')">CCW</button>
@@ -468,6 +485,7 @@ let state = {
   axis: 'y', axis_live: 'y',
   freq: 1.0, amp: 0, amp_live: 0,
   rev_h: 100, rev_v: 100,
+  gamma: 45, gamma_live: 45, tilt_scale: 1,
   rot_dir: 'cw', rot_dir_live: 'cw',
   corner: -1, park: 0, travel: 0,
   signed: [0, 0, 0, 0], pr: [0, 0, 0, 0], pl: [0, 0, 0, 0],
@@ -481,9 +499,11 @@ for (let i = 1; i <= N; i++) {
 let freqDirtyUntil = 0;
 let ampDirtyUntil = 0;
 let revHVDirtyUntil = 0;
+let gammaDirtyUntil = 0;
 let pendingFreq = null; /* last freq we want on the device (null = none) */
 let pendingAmp = null;
 let pendingRevHV = null; /* {h,v} or null */
+let pendingGamma = null;
 let _resyncBusy = false;
 let _dbgLastStatus = 0;
 function dbgLog(hypothesisId, location, message, data) {
@@ -603,11 +623,15 @@ async function allOff() {
   await sendCmd('off all');
 }
 
+function isRevolveAxis(ax) {
+  return ax === 'x' || ax === 'z' || ax === 'tilt';
+}
+
 function liveProgram() {
   if (state.program_live) return state.program_live;
   if (state.program) return state.program;
   const ax = state.axis_live || state.axis || 'y';
-  return (ax === 'x' || ax === 'z') ? 'revolve' : 'rotate';
+  return isRevolveAxis(ax) ? 'revolve' : 'rotate';
 }
 
 function liveAxis() {
@@ -615,7 +639,10 @@ function liveAxis() {
 }
 
 function fieldCaption(prog, axis) {
-  if (prog === 'revolve') return 'revolve ' + String(axis || 'z').toUpperCase();
+  if (prog === 'revolve') {
+    if (axis === 'tilt') return 'revolve tilt';
+    return 'revolve ' + String(axis || 'z').toUpperCase();
+  }
   return 'rotate Y';
 }
 
@@ -627,9 +654,13 @@ async function setFieldRun(on) {
   if (on) {
     const prog = state.program || 'rotate';
     const axis = state.axis || 'y';
-    cmd = (prog === 'revolve')
-      ? ('revolve ' + (axis === 'x' ? 'x' : 'z'))
-      : 'rotate on';
+    if (prog === 'revolve') {
+      if (axis === 'x') cmd = 'revolve x';
+      else if (axis === 'tilt') cmd = 'revolve tilt';
+      else cmd = 'revolve z';
+    } else {
+      cmd = 'rotate on';
+    }
   }
   const ok = await sendCmd(cmd);
   if (!ok) {
@@ -805,8 +836,40 @@ async function applyRevHV() {
 }
 
 async function setAxis(a) {
-  const kind = (a === 'x' || a === 'z') ? 'revolve' : 'rotate';
+  const kind = isRevolveAxis(a) ? 'revolve' : 'rotate';
   await setFieldProgram(kind, a);
+}
+
+function clampGamma(v) {
+  if (!Number.isFinite(v)) return 45;
+  if (v < 0) v = 0;
+  if (v > 90) v = 90;
+  return v;
+}
+
+function onGammaInput(v) {
+  v = clampGamma(v);
+  state.gamma = v;
+  gammaDirtyUntil = Date.now() + 15000;
+  const el = document.getElementById('gammaVal');
+  const lab = document.getElementById('gammaLabel');
+  const rng = document.getElementById('gammaRange');
+  if (el) el.value = v;
+  if (lab) lab.textContent = (+v).toFixed(0);
+  if (rng) rng.value = Math.round(v);
+}
+
+async function applyGamma() {
+  const g = clampGamma(+document.getElementById('gammaVal').value);
+  state.gamma = g;
+  pendingGamma = g;
+  gammaDirtyUntil = Date.now() + 15000;
+  onGammaInput(g);
+  const ok = await sendCmd('gamma ' + g);
+  if (!ok) {
+    showBanner('gamma weak — holding ' + g + ' until confirmed', true);
+  }
+  syncLabels();
 }
 
 async function setMode(m) {
@@ -848,7 +911,7 @@ function syncLabels() {
   document.getElementById('cfgContourLabel').textContent = state.contour ? 'ON' : 'off';
   document.getElementById('cfgRotLabel').textContent = state.rotate ? 'ON' : 'off';
   const axis = state.axis || 'y';
-  const prog = state.program || ((axis === 'x' || axis === 'z') ? 'revolve' : 'rotate');
+  const prog = state.program || (isRevolveAxis(axis) ? 'revolve' : 'rotate');
   document.getElementById('cfgAxisLabel').textContent = fieldCaption(prog, axis);
   document.getElementById('modeOpenBtn').classList.toggle('active', state.mode === 'open');
   document.getElementById('modeClosedBtn').classList.toggle('active', state.mode === 'closed');
@@ -857,9 +920,11 @@ function syncLabels() {
   const rotY = document.getElementById('progRotYBtn');
   const revX = document.getElementById('progRevXBtn');
   const revZ = document.getElementById('progRevZBtn');
+  const revT = document.getElementById('progRevTiltBtn');
   if (rotY) rotY.classList.toggle('active', prog === 'rotate');
   if (revX) revX.classList.toggle('active', prog === 'revolve' && axis === 'x');
   if (revZ) revZ.classList.toggle('active', prog === 'revolve' && axis === 'z');
+  if (revT) revT.classList.toggle('active', prog === 'revolve' && axis === 'tilt');
   const cq = (state.park && state.corner >= 0) ? +state.corner : -1;
   for (let i = 0; i < 4; i++) {
     const b = document.getElementById('cornerQ' + i + 'Btn');
@@ -879,6 +944,8 @@ function syncLabels() {
   document.getElementById('stAmp').textContent = shownAmp;
   const stHV = document.getElementById('stHV');
   if (stHV) stHV.textContent = clampRevPct(state.rev_h) + '/' + clampRevPct(state.rev_v);
+  const stG = document.getElementById('stGamma');
+  if (stG) stG.textContent = clampGamma(state.gamma_live != null ? state.gamma_live : state.gamma).toFixed(0);
   document.getElementById('stDir').textContent = state.rot_dir;
   document.getElementById('stMode').textContent = state.mode;
 
@@ -910,6 +977,11 @@ function syncLabels() {
       pbTitle.textContent = 'M4 = I₂';
       paRole.textContent = 'Revolve Z · XY (Bx, By)';
       pbRole.textContent = 'M1, M3 off';
+    } else if (prog === 'revolve' && axis === 'tilt') {
+      paTitle.textContent = 'M1 / M3 · YZ pair';
+      pbTitle.textContent = 'M2 / M4 · XY pair';
+      paRole.textContent = 'Revolve tilt · γ=' + clampGamma(state.gamma).toFixed(0) + '°';
+      pbRole.textContent = 'all four coils, equal-V split';
     } else {
       paTitle.textContent = 'M1 ∥ M3 · cos ωt';
       pbTitle.textContent = 'M2 ∥ M4 · sin ωt';
@@ -930,7 +1002,8 @@ function syncLabels() {
       const axisFlip = state.axis_live && state.axis && state.axis_live !== state.axis;
       const ramping = derated || flipping || progFlip || axisFlip || (+shownAmp !== +state.amp);
       const hv = (liveProgram() === 'revolve')
-        ? ` · H/V ${clampRevPct(state.rev_h)}/${clampRevPct(state.rev_v)}`
+        ? (` · H/V ${clampRevPct(state.rev_h)}/${clampRevPct(state.rev_v)}` +
+           (liveAxis() === 'tilt' ? ` · γ ${clampGamma(state.gamma).toFixed(0)}°` : ''))
         : '';
       hint.textContent = `${cap} · ${(+state.freq).toFixed(2)} Hz · amp ${shownAmp}` + hv +
         (derated || ramping ? ` (cmd ${state.amp})` : '') +
@@ -1096,11 +1169,30 @@ function applyStatus(s) {
   if (s.axis_live) state.axis_live = s.axis_live;
   else if (s.axis) state.axis_live = s.axis;
   if (!state.program) {
-    state.program = (state.axis === 'x' || state.axis === 'z') ? 'revolve' : 'rotate';
+    state.program = isRevolveAxis(state.axis) ? 'revolve' : 'rotate';
   }
   if (!state.program_live) {
-    state.program_live = (state.axis_live === 'x' || state.axis_live === 'z') ? 'revolve' : 'rotate';
+    state.program_live = isRevolveAxis(state.axis_live) ? 'revolve' : 'rotate';
   }
+  if (s.gamma != null && Number.isFinite(+s.gamma)) {
+    const gBusy = pendingGamma != null || Date.now() < gammaDirtyUntil;
+    const g = clampGamma(+s.gamma);
+    if (pendingGamma != null && Math.abs(g - pendingGamma) < 0.51) {
+      pendingGamma = null;
+      gammaDirtyUntil = 0;
+      state.gamma = g;
+    } else if (!gBusy) {
+      state.gamma = g;
+      const el = document.getElementById('gammaVal');
+      const lab = document.getElementById('gammaLabel');
+      const rng = document.getElementById('gammaRange');
+      if (el) el.value = g;
+      if (lab) lab.textContent = g.toFixed(0);
+      if (rng) rng.value = Math.round(g);
+    }
+  }
+  if (s.gamma_live != null && Number.isFinite(+s.gamma_live)) state.gamma_live = +s.gamma_live;
+  if (s.tilt_scale != null && Number.isFinite(+s.tilt_scale)) state.tilt_scale = +s.tilt_scale;
   if (Array.isArray(s.signed) && s.signed.length >= 4) {
     state.signed = s.signed.slice(0, 4).map(v => +v || 0);
   }
@@ -1372,6 +1464,30 @@ function revolvePairCorner(q, ampH, ampV) {
   return [-sv, sv];
 }
 
+function tiltCommandsAt(tSec, ampH, ampV, gammaDeg, ccw) {
+  const f = Math.max(0.01, +state.freq || 0);
+  let theta = 2 * Math.PI * f * tSec;
+  if (ccw) theta = -theta;
+  const r = clampGamma(gammaDeg) * Math.PI / 180;
+  let sg = Math.sin(r), cg = Math.cos(r);
+  if (gammaDeg <= 0) { sg = 0; cg = 1; }
+  if (gammaDeg >= 90) { sg = 1; cg = 0; }
+  const halfV = 0.5 * ampV;
+  const p13 = Math.SQRT1_2 * Math.hypot(halfV, ampH * cg);
+  const p24 = Math.SQRT1_2 * Math.hypot(halfV, ampH * sg);
+  const pmax = Math.max(p13, p24);
+  const s = (pmax > 255) ? (255 / pmax) : 1;
+  const H = (ampH * s) * Math.cos(theta);
+  const V = (ampV * s) * Math.sin(theta);
+  const k = Math.SQRT1_2;
+  return [
+    k * (0.5 * V - H * cg),
+    k * (0.5 * V + H * sg),
+    k * (-0.5 * V - H * cg),
+    k * (-0.5 * V + H * sg)
+  ];
+}
+
 function revolvePairAt(tSec, ampH, ampV, ccw) {
   const f = Math.max(0.01, +state.freq || 0);
   let theta = 2 * Math.PI * f * tSec;
@@ -1401,6 +1517,17 @@ function coilDutyAt(tSec, coilId) {
   }
   const Ah = amp * clampRevPct(state.rev_h) / 100;
   const Av = amp * clampRevPct(state.rev_v) / 100;
+  if (axis === 'tilt') {
+    let t = tSec;
+    if (state.park && state.corner >= 0) {
+      const f = Math.max(0.01, +state.freq || 0);
+      t = ((+state.corner) / 4) / f;
+      const raw = tiltCommandsAt(t, Ah, Av, clampGamma(state.gamma), false);
+      return raw[coilId - 1] || 0;
+    }
+    const raw = tiltCommandsAt(t, Ah, Av, clampGamma(state.gamma), ccw);
+    return raw[coilId - 1] || 0;
+  }
   const pair = (state.park && state.corner >= 0)
     ? revolvePairCorner(+state.corner, Ah, Av)
     : revolvePairAt(tSec, Ah, Av, ccw);

@@ -49,7 +49,13 @@ This firmware is **four coils only** (M1–M4). PWM goes out the PCA9685; **EN a
 - **Revolve X** (field in the **YZ** plane)
   - Only M1 = I₁, M3 = I₂. M2 and M4 off
   - Same constant-|B| circle with \(B_z\) in place of \(B_x\)
-- **Revolve A scale:** `rev_hv <h%> <v%>` sets \(A_h=\mathrm{amp}\cdot h/100\), \(A_v=\mathrm{amp}\cdot v/100\) (1–200%; 100/100 = circle). Rotate Y ignores this
+- **Revolve tilt** (field about a **fixed** XZ-plane axis \(n=(\cos\gamma,0,\sin\gamma)\))
+  - All four coils. \(\gamma\) is degrees from **+X toward +Z** (`gamma 0..90`). It is **not** the electrical phase and does **not** spin the axis
+  - Equal vertical split. Endpoint **fields** match the revolve X (\(\gamma=0\)) and revolve Z (\(\gamma=90\)) planes; coil commands differ from the legacy two-coil pair
+  - At \(\gamma=90^\circ\), \(\theta=0\) is **−X**, not legacy revolve-Z **+X**
+  - CW = \(+\theta\) (\(\omega=-n\)); CCW = \(-\theta\) (\(\omega=+n\)), same single phase-negation as revolve X/Z
+  - Changing `gamma` while running ramps live amp through 0, then commits \(\sin\gamma/\cos\gamma\) together and ramps up, keeping phase
+- **Revolve A scale:** `rev_hv <h%> <v%>` sets \(A_h=\mathrm{amp}\cdot h/100\), \(A_v=\mathrm{amp}\cdot v/100\) (1–200%; 100/100 = circle; unequal = **ellipse**). Rotate Y ignores this. Tilt uses the same H/V and applies a **shared** scale if any coil would exceed 255 (does not clip coils independently)
 - **MLX90393** at the sample centre (I2C2) streams measured \(B\) in mT for display / Teleplot / JSON. It does **not** correct coil PWM
 - Shared **frequency** (0.01–50 Hz, default 1 Hz) and **amplitude** (0–255, **default 0** — set `amp` before START). Sine LUT is **360** samples (1°).
 - ~1 kHz sine sample ISR; I2C pushes the latest duty to the PCA from the main loop
@@ -122,7 +128,7 @@ Chip X/Y/Z vs lab frame (Y vertical, X/Z horizontal) is remapped with `mlx map x
 | DC | PE13 |
 | BL (active low) | PE10 |
 
-Shows mode/contour or `rotY fHz …mT` / `revX` / `revZ` while the AC field is on, four coil rows, plus a measured **B** row (`B+12.1-0.3+0.1`, `!` = saturation) at ~10 Hz.
+Shows mode/contour or `rotY fHz …mT` / `revX` / `revZ` / `tilt` while the AC field is on, four coil rows, plus a measured **B** row (`B+12.1-0.3+0.1`, `!` = saturation) at ~10 Hz.
 
 ### ESP32 ↔ STM32 bridge (3.3 V, common GND)
 
@@ -161,7 +167,7 @@ WiFi SSID/password and UART pins: `esp32_bridge/include/config.h` (`NUM_COILS` i
 1. Join SoftAP **`CoilControl`** / **`coilcontrol`**
 2. Open **http://192.168.4.1/**
 3. Tabs:
-   - **Field** — Rotate Y / Revolve X / Revolve Z, START/STOP, freq/amp, CW/CCW, soft limit, MLX cal/apply. Canvas is a **math preview** of the commanded waveform (bipolar signed duty, or unipolar RPWM/LPWM). Last `json` sample shows live `signed` / `pr` / `pl` and measured `mlx` mT. For a live scope, use Teleplot on USART1 (below).
+   - **Field** — Rotate Y / Revolve X / Revolve Z / Revolve tilt, START/STOP, freq/amp, γ, CW/CCW, soft limit, MLX cal/apply. Canvas is a **math preview** of the commanded waveform (bipolar signed duty, or unipolar RPWM/LPWM). Last `json` sample shows live `signed` / `pr` / `pl` and measured `mlx` mT. For a live scope, use Teleplot on USART1 (below).
    - **DC coils** — per-coil constant drive, contour, program P1/P2. All four lock while the AC field is on (STOP first).
    - **Logs** — command traffic + raw CLI
 4. Field **STOP** sends `rotate off` (amp fades; also stops revolve). Header **ALL OFF** sends `rotate off` then `off all` — **`off all` cuts immediately**.
@@ -189,11 +195,14 @@ program P1|P2|stop
 axis y
 axis x
 axis z
+axis tilt
 rotate on|off
 rotate on 2.5 160
 revolve z [Hz] [0..255]
 revolve x [Hz] [0..255]
+revolve tilt [Hz] [0..255]
 revolve off
+gamma 45
 rev_hv 100 80
 freq 5
 amp 180
@@ -224,7 +233,7 @@ Lab **B** (PWM-duty proxy, not Tesla — signed duty is treated as coil current)
 - Time: `Bx` (XY horizontal, M2/M4), `By` (vertical, both pairs), `Bz` (YZ horizontal, M1/M3), `Babs` \(=\sqrt{B_x^2+B_y^2+B_z^2}\)
 - XY plots: `Bxy` (Bx vs By), `Bxz` (Bz vs Bx), `Byz` (Bz vs By)
 
-Rotate Y: `By≈0`, `Bx`/`Bz` in quadrature, `Babs` nearly flat at ~amp√2 (circle on `Bxz`). Revolve Z: `Babs` stays at amp (circle on `Bxy`). Revolve X: circle on `Byz`. Hide the plane plots you do not need.
+Rotate Y: `By≈0`, `Bx`/`Bz` in quadrature, `Babs` nearly flat at ~amp√2 (circle on `Bxz`). Revolve Z: `Babs` stays at amp (circle on `Bxy`). Revolve X: circle on `Byz`. Revolve tilt: PWM-proxy `Bn≈0`, `Bh`/`Bv` in quadrature; extra Teleplot series `gamma`, `Bh`, `Bv`, `Bn`, `tilt_scale`. Hide the plane plots you do not need.
 
 **Measured MLX** (mT, Earth/bias subtracted after `mlx offset`): `Bx_m`, `By_m`, `Bz_m`, `Babs_m`, plus `Bxy_m` / `Bxz_m` / `Byz_m` xy-plots. Overlay these on the PWM-proxy traces. A wide measured ellipse with a PWM circle is unequal H/V gain — coil PWM stays geometric; use `rev_hv` if you want to change the commanded ellipse. The MLX never feeds back into coil outputs.
 
@@ -265,13 +274,30 @@ revolve z 0.05 180
 revolve x 2.5 160
 ```
 
-Park at a cardinal with `corner Q0` … `Q3` (aliases `q0`…`q3`). Q0=+Bh, Q1=+Bv, Q2=−Bh, Q3=−Bv. If the field is off this starts revolve (default Z) and sine-swells into that corner. If already revolving, phase travels the circle and holds. `corner run` resumes stepping. You can change program / `rot_dir` / `amp` while the field is on; live amplitude fades through 0 before the new setpoint. `axis y|x|z` selects the program without starting.
+**Revolve tilt** (fixed XZ-plane axis, all four coils). Default \(\gamma=45^\circ\):
+
+```text
+gamma 45
+rev_hv 100 100
+revolve tilt 0.5 80
+```
+
+`gamma 0` is the YZ plane (axis +X). `gamma 90` is the XY plane (axis +Z). Out-of-range values (`gamma 91`, `gamma -1`) are rejected and leave state unchanged. Unequal `rev_hv` in this mode is an ellipse. If a coil would exceed ±255, all four commands share one scale (`tilt_scale` in `status` / `json` / Teleplot).
+
+Park at a cardinal with `corner Q0` … `Q3` (aliases `q0`…`q3`). Q0=+Bh (+h in tilt), Q1=+Bv (+Y), Q2=−Bh, Q3=−Bv. If the field is off this starts revolve (default Z, or the current tilt/X/Z program if already selected) and sine-swells into that corner. If already revolving, phase travels the circle and holds. `corner run` resumes stepping. You can change program / `rot_dir` / `amp` / `gamma` while the field is on; live amplitude fades through 0 before the new setpoint. `axis y|x|z|tilt` selects the program without starting.
+
+Host math checks (no hardware):
+
+```text
+python3 monitor/test_field_waveforms.py
+bash monitor/run_field_tests.sh
+```
 
 **Ramps** (`rotate off`, `revolve off`, START, amp, CW↔CCW, rotate↔revolve): live amplitude steps toward the target (~1.3 s 0↔255). Revolve additionally freezes phase and sine-shapes that envelope so both active coils swell into \(+B_h\) (both \(\approx-A_h/\sqrt{2}\)) before stepping, and shrink in place on stop.
 
 **Immediate cuts:** `off all`, web **ALL OFF**, DC writes to M1–M4, `contour`, `program` (including `program stop`).
 
-`status` reports commanded `program` / `axis` / `rot_dir`, plus `amp` and `amp_live`. `json` also reports `program_live`, `axis_live`, `rot_dir_live` (what the sine ISR is using during a fade), and an `mlx` object (`ok`, `bx/by/bz/babs` in mT). The JSON `rotate` flag is 1 whenever the sine ISR is running (rotate or revolve).
+`status` reports commanded `program` / `axis` / `rot_dir` / `gamma`, plus `amp` and `amp_live`. `json` also reports `program_live`, `axis_live`, `rot_dir_live`, `gamma_live`, `tilt_scale` (what the sine ISR is using during a fade), and an `mlx` object (`ok`, `bx/by/bz/babs` in mT). The JSON `rotate` flag is 1 whenever the sine ISR is running (rotate or revolve). PWM-proxy units are not millitesla; the MLX never feeds the coil equations.
 
 ### MLX centre probe (display only)
 
@@ -294,12 +320,18 @@ If a reading saturates the chip, lower `amp`. Use `rev_hv` to change the command
 ├── include/
 │   ├── st7735.h            # Onboard TFT driver API
 │   ├── display_ui.h        # Live coil status layout
-│   └── mlx90393.h          # Centre magnetometer (I2C2)
+│   ├── mlx90393.h          # Centre magnetometer (I2C2)
+│   └── field_tilt.h        # Tilted-axis inverse (host-testable)
 ├── src/
 │   ├── main.c              # Coil PWM, sine ISR, ADC, dual-UART CLI, MLX cal
+│   ├── field_tilt.c        # Equal-V tilt synthesis + shared scale
 │   ├── mlx90393.c          # I2C2 MLX90393 driver
 │   ├── st7735.c            # SPI4 + ST7735
 │   └── display_ui.c        # Status screen (~10 Hz)
+├── monitor/
+│   ├── test_field_waveforms.py
+│   ├── test_field_tilt.c
+│   └── run_field_tests.sh
 ├── esp32_bridge/
 │   ├── platformio.ini      # ESP32-S3 Arduino env
 │   ├── include/config.h    # SoftAP + UART pins
