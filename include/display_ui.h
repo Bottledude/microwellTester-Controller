@@ -1,6 +1,9 @@
 /**
  * @file display_ui.h
- * @brief Onboard TFT live coil status (per-driver rows).
+ * @brief Onboard TFT live coil status (per-driver rows + reconstructed B).
+ *
+ * Extra row is reconstructed centre B from the four behind-coil MLX90393
+ * chips (n/4 present). Display only — never drives PWM.
  */
 #ifndef DISPLAY_UI_H
 #define DISPLAY_UI_H
@@ -21,6 +24,7 @@ typedef struct {
 
 typedef struct {
   uint8_t present;
+  uint8_t n_present;
   uint8_t sat;
   float   bx_mt, by_mt, bz_mt, babs_mt;
 } DisplayMlxSnap;

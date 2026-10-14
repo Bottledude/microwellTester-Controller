@@ -2,22 +2,20 @@
  * @file main.c
  * @brief STM32H743VIT6 (WeAct Mini) coil driver for 4× BTS7960 / IBT-2.
  *
- * Four coils sit 90° apart around the sample, each tilted ~45° so a coil
- * contributes both horizontal and vertical field at the centre.
+ * Four coils sit 90° apart around the sample, each tilted 30° from
+ * horizontal so a coil contributes both horizontal and vertical field.
  *
  * Lab frame: Y is vertical (out of plane). X and Z are horizontal.
- *   M1/M3 — YZ pair (revolve x; rotate-Y cosine)
- *   M2/M4 — XY pair (revolve z; rotate-Y sine)
+ *   M1/M3 — YZ pair (revolve x / rotate-Y cosine; extra By on revolve z)
+ *   M2/M4 — XY pair (revolve z / rotate-Y sine; extra By on revolve x)
  *
  * Dual modes:
  *   DC        — constant magnitude/dir per coil (open- or closed-loop IS)
  *   Rotate Y  — field in the XZ plane, all four coils. M1=M3 ∝ cos ωt,
  *               M2=M4 ∝ sin ωt (pairs in the same current direction, 90° apart).
- *   Revolve Z — field in the XY plane. Only M2=I1, M4=I2
- *               (Ah=amp*h/100, Av=amp*v/100; 100/100 → constant |B|=amp).
- *   Revolve X — field in the YZ plane. Only M1=I1, M3=I2 (same Ah/Av ellipse).
- *   Revolve tilt — field about a fixed XZ-plane axis n=(cos γ, 0, sin γ).
- *               All four coils. Equal vertical split; see field_tilt.c.
+ *   Revolve X/Z/tilt — four-coil 30° inverse (field_tilt.c). X is γ=0 (YZ),
+ *               Z is γ=90 (XY). Secondary pair supplies By so |Bv|=|Bh|
+ *               at ±Y without cutting horizontal amp. Ah/Av from rev_hv.
  *
  * Shared freq (0.01–50 Hz) + amp; TIM6 sine ISR; amp ramps ~1.3 s.
  * PWM carrier is a PCA9685 (~1 kHz, 12-bit) over I2C — not STM32 timers.
@@ -35,7 +33,7 @@
  *
  * Wiring:
  *   I2C1  PB8 SCL / PB9 SDA  → PCA9685 (addr 0x40). Tie PCA OE to GND.
- *   I2C2  PB10 SCL / PB11 SDA → MLX90393 (3.3 V, CS high). Do not share I2C1.
+ *   I2C2  PB10 SCL / PB11 SDA → 4× MLX90393 behind M1–M4 (3.3 V). Not I2C1.
  *   PCA ch0/1 = M1 RPWM/LPWM, ch2/3 = M2, ch4/5 = M3, ch6/7 = M4.
  *   EN stays on the STM32 (same header clusters as before). IS on PA0–PA3.
  *
@@ -101,7 +99,6 @@ static int str_ieq(const char *a, const char *b)
 #define NUM_ROTATE_COILS        4
 #define SINE_UPDATE_HZ          1000U  /* ISR samples; I2C flush is slower */
 #define SINE_LUT_SIZE           360
-#define SINE_LUT_45             45u
 #define SINE_LUT_90             90u
 #define ROTATE_FREQ_MIN_HZ      0.01f
 #define ROTATE_FREQ_MAX_HZ      50.0f
@@ -169,8 +166,8 @@ typedef enum {
 
 typedef enum {
   FIELD_ROTATE_Y = 0,     /* XZ plane; M1=M3 cos, M2=M4 sin */
-  FIELD_REVOLVE_X = 1,    /* YZ plane; M1=I1, M3=I2 */
-  FIELD_REVOLVE_Z = 2,    /* XY plane; M2=I1, M4=I2 */
+  FIELD_REVOLVE_X = 1,    /* YZ plane; 4-coil synth at γ=0 */
+  FIELD_REVOLVE_Z = 2,    /* XY plane; 4-coil synth at γ=90 */
   FIELD_REVOLVE_TILT = 3  /* fixed XZ-tilt axis; all four coils */
 } FieldProgram;
 
@@ -210,15 +207,25 @@ static ADC_HandleTypeDef  hadc1;
 static I2C_HandleTypeDef  hi2c1;
 static I2C_HandleTypeDef  hi2c2;
 static TIM_HandleTypeDef  htim6;
-static Mlx90393           g_mlx;
-static uint8_t    g_mlx_src[3] = {0, 1, 2}; /* lab X,Y,Z from chip axis */
-static int8_t     g_mlx_sgn[3] = {1, 1, 1};
-static float      g_mlx_b0_mt[3]; /* Earth + bias, lab mT */
-static uint8_t    g_mlx_b0_ok;
-static float      g_mlx_lab_mt[3];
-static float      g_mlx_babs_mt;
-static uint8_t    g_mlx_sat;
-static uint8_t    g_mlx_en = 1; /* poll when the chip is present */
+static Mlx90393   g_mlx_coil[NUM_COILS];
+static uint8_t    g_mlx_bind[NUM_COILS]; /* 0 = auto (sorted scan → M1..M4) */
+static uint8_t    g_mlx_src[NUM_COILS][3] = {
+  {0, 1, 2}, {0, 1, 2}, {0, 1, 2}, {0, 1, 2}
+};
+static int8_t     g_mlx_sgn[NUM_COILS][3] = {
+  {1, 1, 1}, {1, 1, 1}, {1, 1, 1}, {1, 1, 1}
+};
+static float      g_mlx_b0_mt[NUM_COILS][3];
+static uint8_t    g_mlx_b0_ok[NUM_COILS];
+static float      g_mlx_lab_mt[NUM_COILS][3];
+static float      g_mlx_babs_mt[NUM_COILS];
+static float      g_mlx_k[NUM_COILS] = {1.0f, 1.0f, 1.0f, 1.0f};
+static uint8_t    g_mlx_sat[NUM_COILS];
+static float      g_mlx_center_mt[3];
+static float      g_mlx_center_babs;
+static uint8_t    g_mlx_center_sat;
+static uint8_t    g_mlx_n_present;
+static uint8_t    g_mlx_en = 1; /* poll when any chip is present */
 
 static uint8_t           g_pwm_r[NUM_COILS]; /* 0..255 RPWM shadow */
 static uint8_t           g_pwm_l[NUM_COILS];
@@ -243,8 +250,8 @@ static uint8_t           g_revolve_h_pct = (uint8_t)REVOLVE_H_PCT_DEFAULT;
 static uint8_t           g_revolve_v_pct = (uint8_t)REVOLVE_V_PCT_DEFAULT;
 static float             g_tilt_gamma_want = TILT_GAMMA_DEFAULT_DEG;
 static volatile float    g_tilt_gamma_live = TILT_GAMMA_DEFAULT_DEG;
-static volatile float    g_tilt_sin_g = FIELD_TILT_C; /* sin/cos 45° */
-static volatile float    g_tilt_cos_g = FIELD_TILT_C;
+static volatile float    g_tilt_sin_g = FIELD_INV_SQRT2; /* sin/cos 45° */
+static volatile float    g_tilt_cos_g = FIELD_INV_SQRT2;
 static volatile float    g_tilt_scale = 1.0f;
 static volatile uint8_t  g_rotate_stop_pending;
 static volatile uint32_t g_phase;
@@ -494,15 +501,13 @@ static void uart_write_to(CliPort *port, const char *s)
   cli_reply = prev;
 }
 
-/* 45° coil tilt: cos45 = sin45 = √2/2. Signed PWM is the B/current proxy. */
-#define LAB_COS45  0.7071067811865476f
-
+/* 30° coil tilt: c_h = cos30, c_v = sin30. Signed PWM is the B/current proxy. */
 static void lab_from_pair(int16_t b1, int16_t b2, float *horiz, float *vert)
 {
   float s1 = (float)b1;
   float s2 = (float)b2;
-  *horiz = -LAB_COS45 * (s1 + s2);
-  *vert  =  LAB_COS45 * (s1 - s2);
+  *horiz = -FIELD_CH * (s1 + s2);
+  *vert  =  FIELD_CV * (s1 - s2);
 }
 
 /* Teleplot (https://github.com/nesnes/teleplot) on USART1 only — opt-in. */
@@ -584,24 +589,44 @@ static void Teleplot_Emit(void)
   uart_write(line);
   snprintf(line, sizeof(line), ">Byz:%.2f:%.2f|xy\n", (double)bz, (double)by);
   uart_write(line);
-  if (g_mlx.present) {
-    snprintf(line, sizeof(line), ">Bx_m:%.3f\n", (double)g_mlx_lab_mt[0]);
+  if (g_mlx_n_present) {
+    snprintf(line, sizeof(line), ">Bx_c:%.3f\n", (double)g_mlx_center_mt[0]);
     uart_write(line);
-    snprintf(line, sizeof(line), ">By_m:%.3f\n", (double)g_mlx_lab_mt[1]);
+    snprintf(line, sizeof(line), ">By_c:%.3f\n", (double)g_mlx_center_mt[1]);
     uart_write(line);
-    snprintf(line, sizeof(line), ">Bz_m:%.3f\n", (double)g_mlx_lab_mt[2]);
+    snprintf(line, sizeof(line), ">Bz_c:%.3f\n", (double)g_mlx_center_mt[2]);
     uart_write(line);
-    snprintf(line, sizeof(line), ">Babs_m:%.3f\n", (double)g_mlx_babs_mt);
+    snprintf(line, sizeof(line), ">Babs_c:%.3f\n", (double)g_mlx_center_babs);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Bx_m:%.3f\n", (double)g_mlx_center_mt[0]);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">By_m:%.3f\n", (double)g_mlx_center_mt[1]);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Bz_m:%.3f\n", (double)g_mlx_center_mt[2]);
+    uart_write(line);
+    snprintf(line, sizeof(line), ">Babs_m:%.3f\n", (double)g_mlx_center_babs);
     uart_write(line);
     snprintf(line, sizeof(line), ">Bxy_m:%.3f:%.3f|xy\n",
-             (double)g_mlx_lab_mt[0], (double)g_mlx_lab_mt[1]);
+             (double)g_mlx_center_mt[0], (double)g_mlx_center_mt[1]);
     uart_write(line);
     snprintf(line, sizeof(line), ">Byz_m:%.3f:%.3f|xy\n",
-             (double)g_mlx_lab_mt[2], (double)g_mlx_lab_mt[1]);
+             (double)g_mlx_center_mt[2], (double)g_mlx_center_mt[1]);
     uart_write(line);
     snprintf(line, sizeof(line), ">Bxz_m:%.3f:%.3f|xy\n",
-             (double)g_mlx_lab_mt[2], (double)g_mlx_lab_mt[0]);
+             (double)g_mlx_center_mt[2], (double)g_mlx_center_mt[0]);
     uart_write(line);
+    for (int i = 0; i < NUM_COILS; i++) {
+      if (!g_mlx_coil[i].present) continue;
+      snprintf(line, sizeof(line), ">M%d_bx_m:%.3f\n", i + 1,
+               (double)g_mlx_lab_mt[i][0]);
+      uart_write(line);
+      snprintf(line, sizeof(line), ">M%d_by_m:%.3f\n", i + 1,
+               (double)g_mlx_lab_mt[i][1]);
+      uart_write(line);
+      snprintf(line, sizeof(line), ">M%d_bz_m:%.3f\n", i + 1,
+               (double)g_mlx_lab_mt[i][2]);
+      uart_write(line);
+    }
   }
   cli_reply = prev;
 }
@@ -908,30 +933,19 @@ static void PCA9685_Flush(void)
 
   if (rot) {
     /* #region agent log */
-    if (prog == FIELD_REVOLVE_X) {
-      if (r[1] || l[1] || r[3] || l[3]) g_dbg_pair_mis++;
-    } else if (prog == FIELD_REVOLVE_Z) {
-      if (r[0] || l[0] || r[2] || l[2]) g_dbg_pair_mis++;
-    } else if (prog != FIELD_REVOLVE_TILT &&
-               (r[0] != r[2] || l[0] != l[2] || r[1] != r[3] || l[1] != l[3])) {
+    if (prog == FIELD_ROTATE_Y &&
+        (r[0] != r[2] || l[0] != l[2] || r[1] != r[3] || l[1] != l[3])) {
       g_dbg_pair_mis++;
     }
     /* #endregion */
-    if (prog == FIELD_REVOLVE_X) {
-      /* M1 and M3 are independent (I1 vs I2); M2/M4 off. */
-      r[1] = l[1] = r[3] = l[3] = 0;
-    } else if (prog == FIELD_REVOLVE_Z) {
-      /* M2 and M4 are independent (I1 vs I2); M1/M3 off. */
-      r[0] = l[0] = r[2] = l[2] = 0;
-    } else if (prog == FIELD_REVOLVE_TILT) {
-      /* All four coils independent — do not pair or zero. */
-    } else {
+    if (prog == FIELD_ROTATE_Y) {
       /* Rotate Y: opposite coils share the same signed current. */
       r[2] = r[0];
       l[2] = l[0];
       r[3] = r[1];
       l[3] = l[1];
     }
+    /* Revolve X/Z/tilt: all four coils independent. */
   }
 
   for (int i = 0; i < NUM_COILS; i++) {
@@ -1072,12 +1086,13 @@ static void Display_PushStatus(void)
   else if (g_field_prog == FIELD_REVOLVE_TILT) tag = "tilt";
   DisplayMlxSnap mlx;
   memset(&mlx, 0, sizeof(mlx));
-  mlx.present = g_mlx.present;
-  mlx.sat = g_mlx_sat;
-  mlx.bx_mt = g_mlx_lab_mt[0];
-  mlx.by_mt = g_mlx_lab_mt[1];
-  mlx.bz_mt = g_mlx_lab_mt[2];
-  mlx.babs_mt = g_mlx_babs_mt;
+  mlx.present = (g_mlx_n_present > 0) ? 1 : 0;
+  mlx.n_present = g_mlx_n_present;
+  mlx.sat = g_mlx_center_sat;
+  mlx.bx_mt = g_mlx_center_mt[0];
+  mlx.by_mt = g_mlx_center_mt[1];
+  mlx.bz_mt = g_mlx_center_mt[2];
+  mlx.babs_mt = g_mlx_center_babs;
   DisplayUI_Update(g_ctrl_mode == CTRL_OPEN ? "open" : "closed",
                    g_contour_active,
                    g_rotate_active,
@@ -1128,13 +1143,11 @@ static void Coil_ApplyOutputs(uint8_t idx)
   PCA9685_Flush();
 }
 
-/* True if this coil is driven by the live AC program (not an idle revolve partner). */
+/* True if this coil is driven by the live AC program. */
 static uint8_t field_coil_driven(uint8_t idx)
 {
   if (!g_rotate_active || idx >= NUM_COILS) return 0;
-  if (g_field_prog == FIELD_REVOLVE_X) return (idx == 0 || idx == 2) ? 1 : 0;
-  if (g_field_prog == FIELD_REVOLVE_Z) return (idx == 1 || idx == 3) ? 1 : 0;
-  return 1; /* rotate Y uses all four */
+  return 1; /* rotate Y and all revolve programs drive M1–M4 */
 }
 
 /* Bipolar H-bridge duty from signed sample (−255..+255). ISR-safe (no I2C). */
@@ -1240,21 +1253,6 @@ static int16_t sine_scaled(uint16_t idx, uint8_t amp)
   return (int16_t)((SINE_LUT[idx] * (int32_t)amp) >> 15);
 }
 
-/* Q15 LUT peaks are 1 LSB short of ±1; force ±amp at sin = ±1.
- * Magnitude-first so ±LUT mirrors stay equal (ASR of a negative product is not). */
-static int16_t sine_scaled_exact(uint16_t idx, uint8_t amp)
-{
-  int32_t s, mag;
-
-  idx = lut_mod(idx);
-  if (idx == (uint16_t)SINE_LUT_90) return (int16_t)amp;
-  if (idx == (uint16_t)(SINE_LUT_90 + 180u)) return (int16_t)(-(int16_t)amp);
-  s = SINE_LUT[idx];
-  if (s >= 0) return (int16_t)((s * (int32_t)amp) >> 15);
-  mag = ((-s) * (int32_t)amp) >> 15;
-  return (int16_t)(-mag);
-}
-
 static uint8_t clamp_u8_pct(int v)
 {
   if (v < (int)REVOLVE_HV_PCT_MIN) return (uint8_t)REVOLVE_HV_PCT_MIN;
@@ -1284,55 +1282,6 @@ static uint8_t revolve_envelope_amp(uint8_t live, uint8_t peak)
   return (uint8_t)s;
 }
 
-static int16_t clamp_i16_pwm(float v)
-{
-  if (v > 255.0f) return 255;
-  if (v < -255.0f) return -255;
-  if (v >= 0.0f) return (int16_t)(v + 0.5f);
-  return (int16_t)(v - 0.5f);
-}
-
-/*
- * Revolve pair currents. Ah/Av are lab horizontal/vertical radii in PWM units
- * (amp * h%/100 and amp * v%/100). MLX is display-only and does not enter here.
- *   Bh = Ah·cosθ, Bv = Av·sinθ
- *   I1 = (√2/2)(Av sinθ − Ah cosθ), I2 = −(√2/2)(Ah cosθ + Av sinθ)
- * Equal Ah=Av=A recovers I1=A·sin(θ−π/4), I2=−A·sin(θ+π/4).
- * θ=0 is +Bh. CCW uses −phase.
- */
-static void revolve_pair_currents(uint32_t phase, uint8_t amp_h, uint8_t amp_v,
-                                  RotateDir dir,
-                                  int16_t *i1_out, int16_t *i2_out)
-{
-  uint32_t ph = phase;
-  uint16_t si;
-  int16_t i1, i2;
-
-  if (dir == ROT_CCW) ph = 0u - ph;
-  si = lut_from_phase(ph); /* 1 LUT step = 1° */
-
-  if (amp_h == amp_v) {
-    i1 = sine_scaled_exact(lut_add(si, -(int16_t)SINE_LUT_45), amp_h);
-    i2 = (int16_t)(-sine_scaled_exact(lut_add(si, (int16_t)SINE_LUT_45), amp_h));
-    if (i1 > 255) i1 = 255;
-    if (i1 < -255) i1 = -255;
-    if (i2 > 255) i2 = 255;
-    if (i2 < -255) i2 = -255;
-  } else {
-    float invs = 1.0f / 32767.0f;
-    float s = (float)SINE_LUT[si] * invs;
-    float c = (float)SINE_LUT[lut_add(si, (int16_t)SINE_LUT_90)] * invs;
-    float ah = (float)amp_h;
-    float av = (float)amp_v;
-    float i1f = LAB_COS45 * (av * s - ah * c);
-    float i2f = -LAB_COS45 * (ah * c + av * s);
-    i1 = clamp_i16_pwm(i1f);
-    i2 = clamp_i16_pwm(i2f);
-  }
-  *i1_out = i1;
-  *i2_out = i2;
-}
-
 static uint8_t field_is_revolve(FieldProgram p)
 {
   return (p == FIELD_REVOLVE_X || p == FIELD_REVOLVE_Z ||
@@ -1342,6 +1291,22 @@ static uint8_t field_is_revolve(FieldProgram p)
 static uint8_t field_is_tilt(FieldProgram p)
 {
   return (p == FIELD_REVOLVE_TILT) ? 1 : 0;
+}
+
+/* Revolve X/Z pin γ to 0/90; tilt uses the live slider coeffs. */
+static void field_prog_sincos(FieldProgram p, float live_sg, float live_cg,
+                              float *sg, float *cg)
+{
+  if (p == FIELD_REVOLVE_X) {
+    *sg = 0.0f;
+    *cg = 1.0f;
+  } else if (p == FIELD_REVOLVE_Z) {
+    *sg = 1.0f;
+    *cg = 0.0f;
+  } else {
+    *sg = live_sg;
+    *cg = live_cg;
+  }
 }
 
 static void Tilt_CommitGamma(float deg)
@@ -1368,14 +1333,15 @@ static float Tilt_PreviewScale(uint8_t amp)
 {
   uint8_t ah = revolve_scaled_amp(amp, g_revolve_h_pct);
   uint8_t av = revolve_scaled_amp(amp, g_revolve_v_pct);
-  float sg, cg;
-  field_tilt_gamma_sincos(g_tilt_gamma_want, &sg, &cg);
+  float sg, cg, want_sg, want_cg;
+  field_tilt_gamma_sincos(g_tilt_gamma_want, &want_sg, &want_cg);
+  field_prog_sincos(g_field_prog_want, want_sg, want_cg, &sg, &cg);
   return field_tilt_shared_scale((float)ah, (float)av, sg, cg, (float)PWM_ARR);
 }
 
 /*
- * Tilted-axis pair. Direction is applied once by negating phase (same as
- * revolve_pair_currents). Do not also negate H/V or the gamma coefficients.
+ * Four-coil 30° inverse. Direction is applied once by negating phase.
+ * Do not also negate H/V or the gamma coefficients.
  */
 static void revolve_tilt_currents(uint32_t phase, uint8_t amp_h, uint8_t amp_v,
                                   RotateDir dir, float sin_g, float cos_g,
@@ -1913,28 +1879,62 @@ static int parse_motor_token(const char *tok, uint8_t *idx_out)
   return -1;
 }
 
-static void Mlx_ApplySample(const MlxSample *s)
+static void Mlx_ChipToLab(uint8_t coil, const float chip_ut[3], uint8_t sub_b0,
+                          float lab_mt[3])
+{
+  int a;
+  for (a = 0; a < 3; a++) {
+    uint8_t src = g_mlx_src[coil][a];
+    if (src > 2u) src = 0;
+    lab_mt[a] = 0.001f * (float)g_mlx_sgn[coil][a] * chip_ut[src];
+    if (sub_b0 && g_mlx_b0_ok[coil]) lab_mt[a] -= g_mlx_b0_mt[coil][a];
+  }
+}
+
+static void Mlx_ReconstructCenter(void)
+{
+  float b_lab[4][3];
+  uint8_t present[4];
+  int i;
+  memset(b_lab, 0, sizeof(b_lab));
+  for (i = 0; i < NUM_COILS; i++) {
+    present[i] = g_mlx_coil[i].present;
+    if (!present[i]) continue;
+    b_lab[i][0] = g_mlx_lab_mt[i][0];
+    b_lab[i][1] = g_mlx_lab_mt[i][1];
+    b_lab[i][2] = g_mlx_lab_mt[i][2];
+  }
+  field_tilt_reconstruct_center(b_lab, g_mlx_k, present,
+                                &g_mlx_center_mt[0], &g_mlx_center_mt[1],
+                                &g_mlx_center_mt[2]);
+  g_mlx_center_babs = sqrtf(g_mlx_center_mt[0] * g_mlx_center_mt[0] +
+                            g_mlx_center_mt[1] * g_mlx_center_mt[1] +
+                            g_mlx_center_mt[2] * g_mlx_center_mt[2]);
+  g_mlx_center_sat = 0;
+  g_mlx_n_present = 0;
+  for (i = 0; i < NUM_COILS; i++) {
+    if (!g_mlx_coil[i].present) continue;
+    g_mlx_n_present++;
+    if (g_mlx_sat[i]) g_mlx_center_sat = 1;
+  }
+}
+
+static void Mlx_ApplyCoilSample(uint8_t coil, const MlxSample *s)
 {
   float chip_ut[3];
   float lab_mt[3];
-  int i;
 
-  if (!s) return;
+  if (!s || coil >= NUM_COILS) return;
   chip_ut[0] = s->ut_x;
   chip_ut[1] = s->ut_y;
   chip_ut[2] = s->ut_z;
-  for (i = 0; i < 3; i++) {
-    uint8_t src = g_mlx_src[i];
-    if (src > 2u) src = 0;
-    lab_mt[i] = 0.001f * (float)g_mlx_sgn[i] * chip_ut[src];
-    if (g_mlx_b0_ok) lab_mt[i] -= g_mlx_b0_mt[i];
-  }
-  g_mlx_lab_mt[0] = lab_mt[0];
-  g_mlx_lab_mt[1] = lab_mt[1];
-  g_mlx_lab_mt[2] = lab_mt[2];
-  g_mlx_babs_mt = sqrtf(lab_mt[0] * lab_mt[0] + lab_mt[1] * lab_mt[1] +
-                        lab_mt[2] * lab_mt[2]);
-  g_mlx_sat = s->sat;
+  Mlx_ChipToLab(coil, chip_ut, 1, lab_mt);
+  g_mlx_lab_mt[coil][0] = lab_mt[0];
+  g_mlx_lab_mt[coil][1] = lab_mt[1];
+  g_mlx_lab_mt[coil][2] = lab_mt[2];
+  g_mlx_babs_mt[coil] = sqrtf(lab_mt[0] * lab_mt[0] + lab_mt[1] * lab_mt[1] +
+                              lab_mt[2] * lab_mt[2]);
+  g_mlx_sat[coil] = s->sat;
 }
 
 static uint8_t mlx_parse_axis_tok(const char *t, uint8_t *src, int8_t *sgn)
@@ -1953,24 +1953,23 @@ static uint8_t mlx_parse_axis_tok(const char *t, uint8_t *src, int8_t *sgn)
   return 1;
 }
 
-static uint8_t mlx_avg_lab(int n, float lab_mt[3])
+static uint8_t mlx_avg_lab_coil(uint8_t coil, int n, float lab_mt[3])
 {
   float acc[3] = {0, 0, 0};
   int i, got = 0;
   MlxSample s;
-  if (!g_mlx.present) return 0;
+  if (coil >= NUM_COILS || !g_mlx_coil[coil].present) return 0;
   for (i = 0; i < n; i++) {
-    if (!MLX90393_ReadBlocking(&g_mlx, &s)) continue;
+    if (!MLX90393_ReadBlocking(&g_mlx_coil[coil], &s)) continue;
     {
       float chip[3] = {s.ut_x, s.ut_y, s.ut_z};
-      int a;
-      for (a = 0; a < 3; a++) {
-        uint8_t src = g_mlx_src[a];
-        if (src > 2u) src = 0;
-        acc[a] += 0.001f * (float)g_mlx_sgn[a] * chip[src];
-      }
+      float lab[3];
+      Mlx_ChipToLab(coil, chip, 0, lab);
+      acc[0] += lab[0];
+      acc[1] += lab[1];
+      acc[2] += lab[2];
     }
-    g_mlx_sat = (uint8_t)(g_mlx_sat | s.sat);
+    g_mlx_sat[coil] = (uint8_t)(g_mlx_sat[coil] | s.sat);
     got++;
     PCA9685_Flush();
   }
@@ -1978,11 +1977,6 @@ static uint8_t mlx_avg_lab(int n, float lab_mt[3])
   lab_mt[0] = acc[0] / (float)got;
   lab_mt[1] = acc[1] / (float)got;
   lab_mt[2] = acc[2] / (float)got;
-  if (g_mlx_b0_ok) {
-    lab_mt[0] -= g_mlx_b0_mt[0];
-    lab_mt[1] -= g_mlx_b0_mt[1];
-    lab_mt[2] -= g_mlx_b0_mt[2];
-  }
   return 1;
 }
 
@@ -1998,55 +1992,117 @@ static void mlx_all_coils_off(void)
 
 static void Mlx_PrintStatus(void)
 {
-  uart_printf("mlx %s addr=0x%02X poll=%u sat=%u map=%c%c %c%c %c%c b0=%s\r\n",
-              g_mlx.present ? "ok" : "MISSING",
-              (unsigned)g_mlx.addr,
-              (unsigned)g_mlx_en,
-              (unsigned)g_mlx_sat,
-              g_mlx_sgn[0] < 0 ? '-' : '+', "xyz"[g_mlx_src[0]],
-              g_mlx_sgn[1] < 0 ? '-' : '+', "xyz"[g_mlx_src[1]],
-              g_mlx_sgn[2] < 0 ? '-' : '+', "xyz"[g_mlx_src[2]],
-              g_mlx_b0_ok ? "set" : "off");
-  if (g_mlx.present) {
-    uart_printf("  B_mT Bx=%.3f By=%.3f Bz=%.3f |B|=%.3f\r\n",
-                (double)g_mlx_lab_mt[0], (double)g_mlx_lab_mt[1],
-                (double)g_mlx_lab_mt[2], (double)g_mlx_babs_mt);
-    if (g_mlx_b0_ok) {
-      uart_printf("  B0_mT %.3f %.3f %.3f\r\n",
-                  (double)g_mlx_b0_mt[0], (double)g_mlx_b0_mt[1],
-                  (double)g_mlx_b0_mt[2]);
+  int i;
+  uart_printf("mlx poll=%u present=%u/4 center Bx=%.3f By=%.3f Bz=%.3f |B|=%.3f%s\r\n",
+              (unsigned)g_mlx_en, (unsigned)g_mlx_n_present,
+              (double)g_mlx_center_mt[0], (double)g_mlx_center_mt[1],
+              (double)g_mlx_center_mt[2], (double)g_mlx_center_babs,
+              g_mlx_center_sat ? " SAT" : "");
+  for (i = 0; i < NUM_COILS; i++) {
+    uart_printf("  M%d %s addr=0x%02X sat=%u k=%.3f map=%c%c %c%c %c%c b0=%s\r\n",
+                i + 1,
+                g_mlx_coil[i].present ? "ok" : "MISSING",
+                (unsigned)g_mlx_coil[i].addr,
+                (unsigned)g_mlx_sat[i],
+                (double)g_mlx_k[i],
+                g_mlx_sgn[i][0] < 0 ? '-' : '+', "xyz"[g_mlx_src[i][0]],
+                g_mlx_sgn[i][1] < 0 ? '-' : '+', "xyz"[g_mlx_src[i][1]],
+                g_mlx_sgn[i][2] < 0 ? '-' : '+', "xyz"[g_mlx_src[i][2]],
+                g_mlx_b0_ok[i] ? "set" : "off");
+    if (g_mlx_coil[i].present) {
+      uart_printf("     B_mT Bx=%.3f By=%.3f Bz=%.3f |B|=%.3f\r\n",
+                  (double)g_mlx_lab_mt[i][0], (double)g_mlx_lab_mt[i][1],
+                  (double)g_mlx_lab_mt[i][2], (double)g_mlx_babs_mt[i]);
     }
   }
 }
 
 static uint8_t mlx_take_offset(void)
 {
-  float raw[3];
+  int i;
+  uint8_t ok = 0;
   mlx_all_coils_off();
   HAL_Delay(MLX_CAL_SETTLE_MS);
-  g_mlx_b0_ok = 0;
-  g_mlx_sat = 0;
-  if (!mlx_avg_lab((int)MLX_CAL_AVG, raw)) return 0;
-  g_mlx_b0_mt[0] = raw[0];
-  g_mlx_b0_mt[1] = raw[1];
-  g_mlx_b0_mt[2] = raw[2];
-  g_mlx_b0_ok = 1;
-  return 1;
+  for (i = 0; i < NUM_COILS; i++) {
+    float raw[3];
+    g_mlx_b0_ok[i] = 0;
+    g_mlx_sat[i] = 0;
+    if (!g_mlx_coil[i].present) continue;
+    if (!mlx_avg_lab_coil((uint8_t)i, (int)MLX_CAL_AVG, raw)) continue;
+    g_mlx_b0_mt[i][0] = raw[0];
+    g_mlx_b0_mt[i][1] = raw[1];
+    g_mlx_b0_mt[i][2] = raw[2];
+    g_mlx_b0_ok[i] = 1;
+    ok = 1;
+  }
+  Mlx_ReconstructCenter();
+  return ok;
 }
 
 static void mlx_try_init(void)
 {
-  uint8_t found[4];
-  uint8_t n = MLX90393_Scan(&hi2c2, found, 4);
-  uint8_t addr = found[0];
-  if (n == 0) {
-    /* Probe the two common breakout bases even if ACK was flaky. */
-    if (MLX90393_Init(&g_mlx, &hi2c2, 0x18u)) return;
-    if (MLX90393_Init(&g_mlx, &hi2c2, 0x0Cu)) return;
-    g_mlx.present = 0;
-    return;
+  uint8_t found[8];
+  uint8_t n;
+  int i;
+  uint8_t assigned[NUM_COILS];
+
+  memset(assigned, 0, sizeof(assigned));
+  g_mlx_n_present = 0;
+  for (i = 0; i < NUM_COILS; i++) {
+    g_mlx_coil[i].present = 0;
+    g_mlx_coil[i].addr = 0;
   }
-  (void)MLX90393_Init(&g_mlx, &hi2c2, addr);
+
+  n = MLX90393_Scan(&hi2c2, found, 8);
+  if (n == 0) {
+    found[0] = 0x18u;
+    found[1] = 0x0Cu;
+    n = 2;
+  }
+
+  for (i = 0; i < NUM_COILS; i++) {
+    uint8_t addr = g_mlx_bind[i];
+    int k;
+    if (addr == 0) {
+      for (k = 0; k < (int)n; k++) {
+        uint8_t used = 0;
+        int j;
+        for (j = 0; j < i; j++) {
+          if (assigned[j] && g_mlx_coil[j].addr == found[k]) used = 1;
+        }
+        if (!used) {
+          addr = found[k];
+          break;
+        }
+      }
+    }
+    if (addr == 0) continue;
+    if (MLX90393_Init(&g_mlx_coil[i], &hi2c2, addr)) {
+      assigned[i] = 1;
+      g_mlx_n_present++;
+    }
+  }
+  Mlx_ReconstructCenter();
+}
+
+static void Mlx_PollAll(void)
+{
+  int i;
+  for (i = 0; i < NUM_COILS; i++) {
+    if (!g_mlx_coil[i].present) continue;
+    if (!g_mlx_coil[i].sm_tick) {
+      (void)MLX90393_StartMeasure(&g_mlx_coil[i]);
+    }
+  }
+  for (i = 0; i < NUM_COILS; i++) {
+    MlxSample s;
+    if (!g_mlx_coil[i].present) continue;
+    if (MLX90393_ReadIfReady(&g_mlx_coil[i], &s)) {
+      Mlx_ApplyCoilSample((uint8_t)i, &s);
+      (void)MLX90393_StartMeasure(&g_mlx_coil[i]);
+    }
+  }
+  Mlx_ReconstructCenter();
 }
 
 static void CLI_PrintHelp(void)
@@ -2064,13 +2120,13 @@ static void CLI_PrintHelp(void)
     "limit <M#|all> <0..255>      soft current limit (255=~2A, 0=off)\r\n"
     "mode open|closed             open-loop duty vs IS closed-loop [DC]\r\n"
     "rotate on|off [Hz] [0..255]  Y-axis rotate in XZ (M1=M3 cos, M2=M4 sin)\r\n"
-    "revolve x|z|tilt [Hz] [amp]  x=YZ M1/M3; z=XY M2/M4; tilt=fixed XZ axis, all four\r\n"
+    "revolve x|z|tilt [Hz] [amp]  4-coil 30 deg inverse; x=γ0 YZ, z=γ90 XY, tilt=slider\r\n"
     "revolve off                  stop AC field (same ramp as rotate off)\r\n"
     "axis y|x|z|tilt              select program without start (y=rotate, x/z/tilt=revolve)\r\n"
     "gamma <0..90>                tilt-axis angle in deg from +X toward +Z (tilt mode)\r\n"
     "freq <Hz>                    AC field freq 0.01..50 Hz\r\n"
     "amp <0..255>                 shared AC amp (revolve: lab |B|; rotate Y: pair peak)\r\n"
-    "rev_hv <h%> <v%>             Ah=amp*h/100 Av=amp*v/100 (100 100=circle; 25 100 cuts H 4x)\r\n"
+    "rev_hv <h%> <v%>             Ah=amp*h/100 Av=amp*v/100 (100 100=circle; empirical trim)\r\n"
     "rot_dir cw|ccw               rotate: sign of sin pair; revolve: omega -> -omega\r\n"
     "corner Q0|Q1|Q2|Q3|run       park revolve at a cardinal, or resume stepping\r\n"
     "contour on|off               enable M1..M4 together (DC contour)\r\n"
@@ -2080,22 +2136,23 @@ static void CLI_PrintHelp(void)
     "  stop = all off\r\n"
     "json                         machine-readable status (ESP32 / UI)\r\n"
     "teleplot on|off              stream PWM B + measured Bx_m/By_m/Bz_m/Babs_m on USART1 (~50 Hz)\r\n"
-    "mlx                          show measured B (mT); display only, never drives coils\r\n"
-    "mlx on|off                   poll the MLX90393 (I2C2)\r\n"
-    "mlx scan                     rescan I2C2 0x0C..0x1B\r\n"
-    "mlx map <labX> <labY> <labZ> chip axes, e.g. x y z  or  x -z y\r\n"
-    "mlx offset                   coils off → Earth/bias B0 (subtracted from display)\r\n"
+    "mlx                          show 4 behind-coil probes + reconstructed centre B\r\n"
+    "mlx on|off                   poll MLX90393 chips on I2C2\r\n"
+    "mlx scan                     rescan I2C2 0x0C..0x1B, bind by address order\r\n"
+    "mlx bind <a1> <a2> <a3> <a4> 7-bit addrs for M1..M4 (0=auto)\r\n"
+    "mlx map [M#] <X> <Y> <Z>     chip axes (omit M# to apply all)\r\n"
+    "mlx k <M#|all> <scale>       reconstruction scale (default 1)\r\n"
+    "mlx offset                   coils off → Earth/bias B0 per chip\r\n"
     "ping                         bridge heartbeat (replies PONG)\r\n"
     "\r\n"
-    "Y is vertical (out of plane); X and Z are horizontal. Coils tilted ~45 deg.\r\n"
-    "rotate Y: all four, pairs same direction, 90 deg apart — field in XZ.\r\n"
-    "revolve z: M2=I1, M4=I2; Ah/Av from rev_hv (equal=circle). Q0 uses Ah, Q1 uses Av.\r\n"
-    "revolve x: M1=I1, M3=I2, same Ah/Av ellipse; M2,M4 off — field in YZ.\r\n"
-    "revolve tilt: n=(cos g,0,sin g) in XZ; all four coils. gamma 0=+X (YZ plane), 90=+Z (XY).\r\n"
-    "  Endpoint fields match revolve X/Z planes; coil commands differ (equal-V split).\r\n"
-    "  Unequal rev_hv is an ellipse, not constant |B|. Shared scale if a coil would exceed 255.\r\n"
+    "Y is vertical (out of plane); X and Z are horizontal. Coils tilted 30 deg from horizontal.\r\n"
+    "rotate Y: all four, pairs same direction, 90 deg apart — field in XZ, |B|~amp*sqrt(3).\r\n"
+    "revolve x/z/tilt: same 4-coil 30 deg inverse. Secondary pair supplies By so |Bv|=|Bh|\r\n"
+    "  at +/-Y without cutting horizontal amp. 100/100 rev_hv is a PWM-proxy circle.\r\n"
+    "revolve x = gamma 0 (YZ). revolve z = gamma 90 (XY, Q0 is -X). tilt uses the slider.\r\n"
+    "  Unequal rev_hv is an ellipse. Shared scale if a coil would exceed 255.\r\n"
     "  CW = +theta (omega = -n). CCW = -theta (omega = +n). Direction applied once.\r\n"
-    "  gamma=90 Q0 is -X (not legacy revolve-Z +X). Change gamma while running ramps through 0.\r\n"
+    "  Change gamma while running ramps through 0.\r\n"
     "CW corners: Q0=+h/+Bh, Q1=+Y/+Bv, Q2=-h/-Bh, Q3=-Y/-Bv. 'corner Qn' parks there.\r\n"
     "Revolve start/stop: freeze phase, quarter-sine envelope on |A|, then step.\r\n"
     "Start/stop/CW↔CCW/program change fade live amp through 0 (~1.3 s 0↔255).\r\n"
@@ -2103,11 +2160,11 @@ static void CLI_PrintHelp(void)
     "off all cuts immediately. DC writes to M1..M4 auto-stop the AC field.\r\n"
     "Limits while the field is on derate shared amp (3-tick hysteresis). Boot soft-limits ~2 A.\r\n"
     "PWM is PCA9685 on I2C1 PB8=SCL PB9=SDA (addr 0x40, ~1 kHz). EN is STM32 GPIO.\r\n"
-    "MLX90393 on I2C2 PB10=SCL PB11=SDA (3.3 V, CS high). Do not share I2C1.\r\n"
+    "4x MLX90393 behind M1-M4 on I2C2 PB10=SCL PB11=SDA (3.3 V). Do not share I2C1.\r\n"
     "teleplot: USART1 Serial Monitor only (not ESP32). Open Teleplot on that port.\r\n"
-    "  PWM-proxy B (45 deg, signed duty as current): Bx By Bz Babs, Bxy/Bxz/Byz xy.\r\n"
-    "  Measured MLX (mT, B0 subtracted): Bx_m By_m Bz_m Babs_m, Bxy_m/Byz_m xy.\r\n"
-    "  Coil PWM is geometric (rev_hv / 45 deg). MLX is display-only.\r\n"
+    "  PWM-proxy B (30 deg): Bx By Bz Babs, Bxy/Bxz/Byz xy.\r\n"
+    "  Reconstructed centre (mT): Bx_c/By_c/Bz_c/Babs_c (aliases Bx_m..). Per-coil M#_bx_m.\r\n"
+    "  Coil PWM is geometric (30 deg / rev_hv). Hall sensors are display-only.\r\n"
     "\r\n"
   );
 }
@@ -2189,7 +2246,7 @@ static void CLI_HandleLine(char *line)
       amps[i] = Sense_ReadAmps((uint8_t)i);
       if (g_rotate_active) PCA9685_Flush();
     }
-    static char js[2048];
+    static char js[4096];
     uint8_t pr[NUM_COILS], pl[NUM_COILS];
     int16_t sd[NUM_COILS];
     uint8_t pca, dirty, over;
@@ -2253,17 +2310,36 @@ static void CLI_HandleLine(char *line)
                     s->dir == DIR_FWD ? 1 : -1,
                     s->duty_applied, amps[i], s->i_limit_a);
     }
-    if (n > 0 && n < (int)sizeof(js) - 360) {
+    if (n > 0 && n < (int)sizeof(js) - 900) {
       /* #region agent log */
       n += snprintf(js + n, sizeof(js) - (size_t)n,
-                    "],\"mlx\":{\"ok\":%u,\"addr\":%u,\"sat\":%u,"
-                    "\"bx\":%.3f,\"by\":%.3f,\"bz\":%.3f,\"babs\":%.3f},"
+                    "],\"mlx\":{\"ok\":%u,\"n\":%u,\"sat\":%u,"
+                    "\"bx\":%.3f,\"by\":%.3f,\"bz\":%.3f,\"babs\":%.3f,"
+                    "\"center\":{\"bx\":%.3f,\"by\":%.3f,\"bz\":%.3f,\"babs\":%.3f},"
+                    "\"coils\":[",
+                    (unsigned)(g_mlx_n_present > 0), (unsigned)g_mlx_n_present,
+                    (unsigned)g_mlx_center_sat,
+                    (double)g_mlx_center_mt[0], (double)g_mlx_center_mt[1],
+                    (double)g_mlx_center_mt[2], (double)g_mlx_center_babs,
+                    (double)g_mlx_center_mt[0], (double)g_mlx_center_mt[1],
+                    (double)g_mlx_center_mt[2], (double)g_mlx_center_babs);
+      for (int i = 0; i < NUM_COILS && n > 0 && n < (int)sizeof(js) - 220; i++) {
+        n += snprintf(js + n, sizeof(js) - (size_t)n,
+                      "%s{\"ok\":%u,\"addr\":%u,\"sat\":%u,\"k\":%.3f,"
+                      "\"bx\":%.3f,\"by\":%.3f,\"bz\":%.3f,\"babs\":%.3f}",
+                      i ? "," : "",
+                      (unsigned)g_mlx_coil[i].present,
+                      (unsigned)g_mlx_coil[i].addr,
+                      (unsigned)g_mlx_sat[i],
+                      (double)g_mlx_k[i],
+                      (double)g_mlx_lab_mt[i][0], (double)g_mlx_lab_mt[i][1],
+                      (double)g_mlx_lab_mt[i][2], (double)g_mlx_babs_mt[i]);
+      }
+      n += snprintf(js + n, sizeof(js) - (size_t)n,
+                    "]},"
                     "\"dbg\":{\"ore1\":%lu,\"ore3\":%lu,\"empty\":%lu,\"lines\":%lu,"
                     "\"pca\":%u,\"dirty\":%u,\"isr\":%lu,\"over\":%u,"
                     "\"pr\":[%u,%u,%u,%u],\"pl\":[%u,%u,%u,%u]}}\r\n",
-                    (unsigned)g_mlx.present, (unsigned)g_mlx.addr, (unsigned)g_mlx_sat,
-                    (double)g_mlx_lab_mt[0], (double)g_mlx_lab_mt[1],
-                    (double)g_mlx_lab_mt[2], (double)g_mlx_babs_mt,
                     (unsigned long)ore1, (unsigned long)ore3,
                     (unsigned long)empty, (unsigned long)lines,
                     (unsigned)pca, (unsigned)dirty, (unsigned long)isr, (unsigned)over,
@@ -2636,8 +2712,8 @@ static void CLI_HandleLine(char *line)
     }
     if (str_ieq(argv[1], "on") || str_ieq(argv[1], "1")) {
       g_mlx_en = 1;
-      if (!g_mlx.present) mlx_try_init();
-      uart_printf("mlx=on present=%u\r\n", (unsigned)g_mlx.present);
+      if (g_mlx_n_present == 0) mlx_try_init();
+      uart_printf("mlx=on present=%u/4\r\n", (unsigned)g_mlx_n_present);
       return;
     }
     if (str_ieq(argv[1], "off") || str_ieq(argv[1], "0")) {
@@ -2650,17 +2726,74 @@ static void CLI_HandleLine(char *line)
       Mlx_PrintStatus();
       return;
     }
+    if (str_ieq(argv[1], "bind")) {
+      int i;
+      if (argc < 6) {
+        uart_write("usage: mlx bind <M1addr> <M2addr> <M3addr> <M4addr>  (0=auto)\r\n");
+        return;
+      }
+      for (i = 0; i < NUM_COILS; i++) {
+        unsigned v = (unsigned)strtoul(argv[2 + i], NULL, 0);
+        if (v > 0x7Fu) {
+          uart_write("mlx bind: 7-bit addresses only\r\n");
+          return;
+        }
+        g_mlx_bind[i] = (uint8_t)v;
+      }
+      mlx_try_init();
+      uart_printf("mlx bind 0x%02X 0x%02X 0x%02X 0x%02X  present=%u/4\r\n",
+                  (unsigned)g_mlx_bind[0], (unsigned)g_mlx_bind[1],
+                  (unsigned)g_mlx_bind[2], (unsigned)g_mlx_bind[3],
+                  (unsigned)g_mlx_n_present);
+      return;
+    }
+    if (str_ieq(argv[1], "k")) {
+      uint8_t idx = 0;
+      int all = 0;
+      float k;
+      int i;
+      if (argc < 4) {
+        uart_write("usage: mlx k <M1..M4|all> <scale>\r\n");
+        return;
+      }
+      if (str_ieq(argv[2], "all")) all = 1;
+      else if (parse_motor_token(argv[2], &idx) != 0) {
+        uart_write("usage: mlx k <M1..M4|all> <scale>\r\n");
+        return;
+      }
+      k = (float)atof(argv[3]);
+      if (!(k > 0.0f) || k > 1.0e6f) {
+        uart_write("mlx k: scale must be > 0\r\n");
+        return;
+      }
+      if (all) {
+        for (i = 0; i < NUM_COILS; i++) g_mlx_k[i] = k;
+      } else {
+        g_mlx_k[idx] = k;
+      }
+      Mlx_ReconstructCenter();
+      uart_printf("mlx k M%d=%.3f%s\r\n", all ? 0 : (int)(idx + 1), (double)k,
+                  all ? " (all)" : "");
+      return;
+    }
     if (str_ieq(argv[1], "map")) {
       uint8_t src[3];
       int8_t sgn[3];
       uint8_t used = 0;
       int i;
-      if (argc < 5) {
-        uart_write("usage: mlx map <labX> <labY> <labZ>   e.g. mlx map x y z\r\n");
+      int arg0 = 2;
+      int coil = -1;
+      uint8_t idx;
+      if (argc >= 6 && parse_motor_token(argv[2], &idx) == 0) {
+        coil = (int)idx;
+        arg0 = 3;
+      }
+      if (argc < arg0 + 3) {
+        uart_write("usage: mlx map [M#] <labX> <labY> <labZ>   e.g. mlx map x y z\r\n");
         return;
       }
       for (i = 0; i < 3; i++) {
-        if (!mlx_parse_axis_tok(argv[2 + i], &src[i], &sgn[i])) {
+        if (!mlx_parse_axis_tok(argv[arg0 + i], &src[i], &sgn[i])) {
           uart_write("mlx map: need x|y|z with optional + or - prefix\r\n");
           return;
         }
@@ -2670,29 +2803,45 @@ static void CLI_HandleLine(char *line)
         }
         used |= (uint8_t)(1u << src[i]);
       }
-      for (i = 0; i < 3; i++) {
-        g_mlx_src[i] = src[i];
-        g_mlx_sgn[i] = sgn[i];
+      if (coil >= 0) {
+        for (i = 0; i < 3; i++) {
+          g_mlx_src[coil][i] = src[i];
+          g_mlx_sgn[coil][i] = sgn[i];
+        }
+      } else {
+        int c;
+        for (c = 0; c < NUM_COILS; c++) {
+          for (i = 0; i < 3; i++) {
+            g_mlx_src[c][i] = src[i];
+            g_mlx_sgn[c][i] = sgn[i];
+          }
+        }
       }
-      uart_printf("mlx map labXYZ=%c%c %c%c %c%c\r\n",
-                  sgn[0] < 0 ? '-' : '+', "xyz"[src[0]],
-                  sgn[1] < 0 ? '-' : '+', "xyz"[src[1]],
-                  sgn[2] < 0 ? '-' : '+', "xyz"[src[2]]);
+      if (coil >= 0) {
+        uart_printf("mlx map M%d labXYZ=%c%c %c%c %c%c\r\n", coil + 1,
+                    sgn[0] < 0 ? '-' : '+', "xyz"[src[0]],
+                    sgn[1] < 0 ? '-' : '+', "xyz"[src[1]],
+                    sgn[2] < 0 ? '-' : '+', "xyz"[src[2]]);
+      } else {
+        uart_printf("mlx map all labXYZ=%c%c %c%c %c%c\r\n",
+                    sgn[0] < 0 ? '-' : '+', "xyz"[src[0]],
+                    sgn[1] < 0 ? '-' : '+', "xyz"[src[1]],
+                    sgn[2] < 0 ? '-' : '+', "xyz"[src[2]]);
+      }
       return;
     }
     if (str_ieq(argv[1], "offset")) {
-      if (!g_mlx.present) { uart_write("mlx missing\r\n"); return; }
+      if (g_mlx_n_present == 0) { uart_write("mlx missing\r\n"); return; }
       if (g_rotate_active) Rotate_Stop();
       if (mlx_take_offset()) {
-        uart_printf("mlx B0=%.3f %.3f %.3f mT\r\n",
-                    (double)g_mlx_b0_mt[0], (double)g_mlx_b0_mt[1],
-                    (double)g_mlx_b0_mt[2]);
+        uart_write("mlx offset set (per coil)\r\n");
+        Mlx_PrintStatus();
       } else {
         uart_write("mlx offset failed\r\n");
       }
       return;
     }
-    uart_write("usage: mlx | on|off | scan | map | offset\r\n");
+    uart_write("usage: mlx | on|off | scan | bind | map | k | offset\r\n");
     return;
   }
   if (!strcmp(cmd, "teleplot") || !strcmp(cmd, "tp")) {
@@ -2729,10 +2878,10 @@ static void CLI_HandleLine(char *line)
       uart_write("axis=y program=rotate (XZ, all four coils)\r\n");
     } else if (str_ieq(argv[1], "x") || str_ieq(argv[1], "yz")) {
       Field_SetProgram(FIELD_REVOLVE_X);
-      uart_write("axis=x program=revolve (YZ, M1=I1 M3=I2)\r\n");
+      uart_write("axis=x program=revolve (YZ, 4-coil gamma=0)\r\n");
     } else if (str_ieq(argv[1], "z") || str_ieq(argv[1], "xy")) {
       Field_SetProgram(FIELD_REVOLVE_Z);
-      uart_write("axis=z program=revolve (XY, M2=I1 M4=I2)\r\n");
+      uart_write("axis=z program=revolve (XY, 4-coil gamma=90)\r\n");
     } else if (str_ieq(argv[1], "tilt") || str_ieq(argv[1], "tilted") ||
                str_ieq(argv[1], "n")) {
       Field_SetProgram(FIELD_REVOLVE_TILT);
@@ -2833,10 +2982,13 @@ int main(void)
   Display_PushStatus();
 
   if (g_pca_ok) {
-    uart_write_to(&cli_ports[0],
-                  g_mlx.present
-                    ? "\r\n\r\nH743 coil driver ready (PCA9685 PWM, MLX90393). Type 'help'.\r\n> "
-                    : "\r\n\r\nH743 coil driver ready (PCA9685 PWM, no MLX on I2C2). Type 'help'.\r\n> ");
+    if (g_mlx_n_present) {
+      uart_printf("\r\n\r\nH743 coil driver ready (PCA9685 PWM, MLX %u/4). Type 'help'.\r\n> ",
+                  (unsigned)g_mlx_n_present);
+    } else {
+      uart_write_to(&cli_ports[0],
+                    "\r\n\r\nH743 coil driver ready (PCA9685 PWM, no MLX on I2C2). Type 'help'.\r\n> ");
+    }
   } else {
     uart_write_to(&cli_ports[0],
                   "\r\n\r\nH743 ready but PCA9685 MISSING on I2C1 0x40 — PWM dead. Type 'help'.\r\n> ");
@@ -2850,11 +3002,8 @@ int main(void)
   while (1) {
     CLI_Poll();
     PCA9685_Flush();
-    if (g_mlx_en && g_mlx.present) {
-      MlxSample s;
-      uint8_t fresh = 0;
-      MLX90393_Poll(&g_mlx, &s, &fresh);
-      if (fresh) Mlx_ApplySample(&s);
+    if (g_mlx_en && g_mlx_n_present) {
+      Mlx_PollAll();
     }
 
     uint32_t now = HAL_GetTick();
@@ -2951,11 +3100,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (hold) a_cmd = revolve_envelope_amp(amp, g_revolve_env_peak);
     amp_h = revolve_scaled_amp(a_cmd, g_revolve_h_pct);
     amp_v = revolve_scaled_amp(a_cmd, g_revolve_v_pct);
-    if (prog == FIELD_REVOLVE_TILT) {
+    {
       int16_t cmd[4];
-      float sg = g_tilt_sin_g;
-      float cg = g_tilt_cos_g;
-      float scale;
+      float sg, cg, scale;
+      field_prog_sincos(prog, g_tilt_sin_g, g_tilt_cos_g, &sg, &cg);
       revolve_tilt_currents(g_phase, amp_h, amp_v, g_rotate_dir, sg, cg,
                             cmd, &scale);
       g_tilt_scale = scale;
@@ -2963,20 +3111,6 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       Coil_ApplySignedDuty(1, cmd[1]);
       Coil_ApplySignedDuty(2, cmd[2]);
       Coil_ApplySignedDuty(3, cmd[3]);
-    } else {
-      int16_t i1, i2;
-      revolve_pair_currents(g_phase, amp_h, amp_v, g_rotate_dir, &i1, &i2);
-      if (prog == FIELD_REVOLVE_Z) {
-        Coil_ApplySignedDuty(0, 0);
-        Coil_ApplySignedDuty(2, 0);
-        Coil_ApplySignedDuty(1, i1); /* M2 = I1 */
-        Coil_ApplySignedDuty(3, i2); /* M4 = I2 */
-      } else {
-        Coil_ApplySignedDuty(1, 0);
-        Coil_ApplySignedDuty(3, 0);
-        Coil_ApplySignedDuty(0, i1); /* M1 = I1 */
-        Coil_ApplySignedDuty(2, i2); /* M3 = I2 */
-      }
     }
   }
 }

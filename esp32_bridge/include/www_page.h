@@ -271,13 +271,13 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
       <div class="kv" style="margin-top:8px">
         Live firmware snapshot (from <code>json</code>): <b id="signedSnap">—</b><br/>
-        MLX90393 (mT, centre): <b id="mlxSnap">—</b><br/>
+        MLX reconstructed centre (mT): <b id="mlxSnap">—</b><br/>
         Live scope: USB Serial Monitor + Teleplot — type <code>teleplot on</code> on USART1.
         PWM-proxy series <code>Bx/By/Babs</code>; measured <code>Bx_m/By_m/Babs_m</code>.
       </div>
     </div>
     <h2 class="section-title">Rotate / revolve</h2>
-    <p class="section-help">Y is vertical (out of plane); X and Z are horizontal. Coils at 90°, each tilted ~45°. <b>Rotate Y</b>: field in XZ — M1=M3 ∝ cos ωt, M2=M4 ∝ sin ωt (same current direction within each pair). <b>Revolve Z</b>: XY plane, M2=I₁ and M4=I₂. <code>rev_hv</code> sets A<sub>h</sub>/A<sub>v</sub> (100/100 = PWM circle; 25/100 cuts H 4×; unequal = ellipse). The MLX90393 only displays measured B — it does not correct coil PWM. <b>Revolve X</b>: same on M1/M3 in YZ. <b>Revolve tilt</b>: field about a fixed XZ-plane axis n=(cos γ, 0, sin γ); all four coils. γ from +X toward +Z (0–90°). ALL OFF still cuts immediately.</p>
+    <p class="section-help">Y is vertical (out of plane); X and Z are horizontal. Coils at 90°, each tilted 30° from horizontal. <b>Rotate Y</b>: field in XZ — M1=M3 ∝ cos ωt, M2=M4 ∝ sin ωt. <b>Revolve X/Z/tilt</b> share a four-coil 30° inverse: the secondary pair supplies B<sub>y</sub> so |B<sub>v</sub>| matches |B<sub>h</sub>| at ±Y without cutting horizontal amp. X = γ=0 (YZ), Z = γ=90 (XY). Hall chips behind each coil reconstruct centre B for display only. ALL OFF still cuts immediately.</p>
     <div class="cfg-grid">
       <div class="card">
         <h2>Run control</h2>
@@ -302,7 +302,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Field program</h2>
-        <p class="section-help">Rotate Y uses all four coils. Revolve X uses M1/M3 only. Revolve Z uses M2/M4 only. Revolve tilt uses all four about a fixed XZ axis.</p>
+        <p class="section-help">All programs use four coils. Revolve X is γ=0 (YZ). Revolve Z is γ=90 (XY). Revolve tilt uses the γ slider.</p>
         <div class="seg quad">
           <button type="button" id="progRotYBtn" class="active" onclick="setFieldProgram('rotate','y')">Rotate Y</button>
           <button type="button" id="progRevXBtn" onclick="setFieldProgram('revolve','x')">Revolve X</button>
@@ -328,7 +328,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Amplitude</h2>
-        <p class="section-help">Shared peak duty 0–255 (Bmax/μ scale). Rotate Y and revolve tilt: all four. Revolve X: M1/M3. Revolve Z: M2/M4.</p>
+        <p class="section-help">Shared peak duty 0–255 (Bmax/μ scale). Rotate Y and all revolve programs drive M1–M4.</p>
         <div class="field">
           <label for="ampVal">Amplitude <b id="ampLabel">0</b></label>
           <input id="ampVal" type="number" min="0" max="255" step="1" value="0"
@@ -342,7 +342,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Revolve A scale (H / V)</h2>
-        <p class="section-help">A<sub>h</sub>=amp·H/100, A<sub>v</sub>=amp·V/100. 100/100 is a PWM-proxy circle. Unequal radii are an ellipse, not constant |B|. If real H is 4× V, use <b>25 / 100</b> (do not boost V 4× — that saturates PWM). Rotate Y ignores this. Tilt mode uses the same H/V and may shared-scale if a coil would exceed 255.</p>
+        <p class="section-help">A<sub>h</sub>=amp·H/100, A<sub>v</sub>=amp·V/100. 100/100 is a PWM-proxy circle (geometry no longer requires cutting H). Unequal radii are an ellipse. Rotate Y ignores this. Shared-scale if a coil would exceed 255.</p>
         <div class="field">
           <label for="revHVal">Horizontal % <b id="revHLabel">100</b></label>
           <input id="revHVal" type="number" min="1" max="200" step="1" value="100"
@@ -378,10 +378,11 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
 
       <div class="card">
-        <h2>MLX90393 centre probe</h2>
-        <p class="section-help">I2C2 PB10 SCL / PB11 SDA, 3.3 V, not on the PCA bus. Display only — measured B never changes coil PWM. Offset zeros Earth/bias with coils off.</p>
-        <div class="kv">Chip: <b id="mlxPresent">—</b><br/>
-          B (mT): <b id="mlxB">—</b>
+        <h2>MLX90393 behind coils</h2>
+        <p class="section-help">Four chips on I2C2 (PB10/PB11, 3.3 V), one behind each coil. Centre B is reconstructed with the 30° mixing map. Display only — never drives PWM. Offset zeros Earth/bias with coils off.</p>
+        <div class="kv">Present: <b id="mlxPresent">—</b><br/>
+          Centre (mT): <b id="mlxB">—</b><br/>
+          Coils: <b id="mlxCoils">—</b>
         </div>
         <div class="toolbar" style="margin-top:12px;margin-bottom:0;flex-wrap:wrap">
           <button type="button" onclick="sendCmd('mlx scan')">Scan</button>
@@ -949,14 +950,8 @@ function syncLabels() {
   document.getElementById('stDir').textContent = state.rot_dir;
   document.getElementById('stMode').textContent = state.mode;
 
-  let ia, ib;
-  if (prog === 'revolve' && axis === 'x') {
-    ia = avgI([1]); ib = avgI([3]);
-  } else if (prog === 'revolve' && axis === 'z') {
-    ia = avgI([2]); ib = avgI([4]);
-  } else {
-    ia = avgI([1, 3]); ib = avgI([2, 4]);
-  }
+  const ia = avgI([1, 3]);
+  const ib = avgI([2, 4]);
   document.getElementById('stIA').textContent = ia.toFixed(3) + ' A';
   document.getElementById('stIB').textContent = ib.toFixed(3) + ' A';
   document.getElementById('phaseAI').textContent = ia.toFixed(3);
@@ -968,20 +963,20 @@ function syncLabels() {
   const pbRole = document.getElementById('phaseBRole');
   if (paTitle && pbTitle && paRole && pbRole) {
     if (prog === 'revolve' && axis === 'x') {
-      paTitle.textContent = 'M1 = I₁';
-      pbTitle.textContent = 'M3 = I₂';
-      paRole.textContent = 'Revolve X · YZ (Bz, By)';
-      pbRole.textContent = 'M2, M4 off';
+      paTitle.textContent = 'M1 / M3 · YZ (H)';
+      pbTitle.textContent = 'M2 / M4 · extra By';
+      paRole.textContent = 'Revolve X · YZ, γ=0';
+      pbRole.textContent = 'all four coils, 30° inverse';
     } else if (prog === 'revolve' && axis === 'z') {
-      paTitle.textContent = 'M2 = I₁';
-      pbTitle.textContent = 'M4 = I₂';
-      paRole.textContent = 'Revolve Z · XY (Bx, By)';
-      pbRole.textContent = 'M1, M3 off';
+      paTitle.textContent = 'M2 / M4 · XY (H)';
+      pbTitle.textContent = 'M1 / M3 · extra By';
+      paRole.textContent = 'Revolve Z · XY, γ=90';
+      pbRole.textContent = 'all four coils, 30° inverse';
     } else if (prog === 'revolve' && axis === 'tilt') {
       paTitle.textContent = 'M1 / M3 · YZ pair';
       pbTitle.textContent = 'M2 / M4 · XY pair';
       paRole.textContent = 'Revolve tilt · γ=' + clampGamma(state.gamma).toFixed(0) + '°';
-      pbRole.textContent = 'all four coils, equal-V split';
+      pbRole.textContent = 'all four coils, 30° equal-V split';
     } else {
       paTitle.textContent = 'M1 ∥ M3 · cos ωt';
       pbTitle.textContent = 'M2 ∥ M4 · sin ωt';
@@ -1003,7 +998,7 @@ function syncLabels() {
       const ramping = derated || flipping || progFlip || axisFlip || (+shownAmp !== +state.amp);
       const hv = (liveProgram() === 'revolve')
         ? (` · H/V ${clampRevPct(state.rev_h)}/${clampRevPct(state.rev_v)}` +
-           (liveAxis() === 'tilt' ? ` · γ ${clampGamma(state.gamma).toFixed(0)}°` : ''))
+           ` · γ ${clampGamma(liveAxis() === 'x' ? 0 : liveAxis() === 'z' ? 90 : state.gamma).toFixed(0)}°`)
         : '';
       hint.textContent = `${cap} · ${(+state.freq).toFixed(2)} Hz · amp ${shownAmp}` + hv +
         (derated || ramping ? ` (cmd ${state.amp})` : '') +
@@ -1215,16 +1210,27 @@ function applyStatus(s) {
   const mlxSnap = document.getElementById('mlxSnap');
   const mlxPresent = document.getElementById('mlxPresent');
   const mlxB = document.getElementById('mlxB');
+  const mlxCoils = document.getElementById('mlxCoils');
   if (mlx && +mlx.ok) {
-    const btxt = `Bx ${(+mlx.bx).toFixed(2)}  By ${(+mlx.by).toFixed(2)}  Bz ${(+mlx.bz).toFixed(2)}  |B| ${(+mlx.babs).toFixed(2)} mT` +
+    const ctr = mlx.center || mlx;
+    const btxt = `Bx ${(+ctr.bx).toFixed(2)}  By ${(+ctr.by).toFixed(2)}  Bz ${(+ctr.bz).toFixed(2)}  |B| ${(+ctr.babs).toFixed(2)} mT` +
       (+mlx.sat ? '  SAT' : '');
     if (mlxSnap) mlxSnap.textContent = btxt;
-    if (mlxPresent) mlxPresent.textContent = '0x' + ((+mlx.addr) >>> 0).toString(16);
+    const n = (mlx.n != null) ? +mlx.n : 1;
+    if (mlxPresent) mlxPresent.textContent = n + '/4';
     if (mlxB) mlxB.textContent = btxt;
+    if (mlxCoils && Array.isArray(mlx.coils)) {
+      mlxCoils.textContent = mlx.coils.map((c, i) =>
+        +c.ok ? ('M' + (i + 1) + ' 0x' + ((+c.addr) >>> 0).toString(16) +
+          ' |B| ' + (+c.babs).toFixed(2)) : ('M' + (i + 1) + ' --')).join(' · ');
+    } else if (mlxCoils) {
+      mlxCoils.textContent = '—';
+    }
   } else {
     if (mlxSnap) mlxSnap.textContent = 'not found on I2C2';
-    if (mlxPresent) mlxPresent.textContent = 'missing';
+    if (mlxPresent) mlxPresent.textContent = '0/4';
     if (mlxB) mlxB.textContent = '—';
+    if (mlxCoils) mlxCoils.textContent = '—';
   }
   s.coils.forEach((c, idx) => {
     if (!state.coils[idx]) return;
@@ -1455,14 +1461,9 @@ function resizeWaveCanvas() {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-function revolvePairCorner(q, ampH, ampV) {
-  const sh = ampH * Math.SQRT1_2;
-  const sv = ampV * Math.SQRT1_2;
-  if (q === 0) return [-sh, -sh];
-  if (q === 1) return [sv, -sv];
-  if (q === 2) return [sh, sh];
-  return [-sv, sv];
-}
+const FIELD_CH = Math.sqrt(3) / 2;
+const FIELD_INV_H = 1 / (2 * FIELD_CH);
+const FIELD_INV_V = 1 / (4 * 0.5);
 
 function tiltCommandsAt(tSec, ampH, ampV, gammaDeg, ccw) {
   const f = Math.max(0.01, +state.freq || 0);
@@ -1472,32 +1473,17 @@ function tiltCommandsAt(tSec, ampH, ampV, gammaDeg, ccw) {
   let sg = Math.sin(r), cg = Math.cos(r);
   if (gammaDeg <= 0) { sg = 0; cg = 1; }
   if (gammaDeg >= 90) { sg = 1; cg = 0; }
-  const halfV = 0.5 * ampV;
-  const p13 = Math.SQRT1_2 * Math.hypot(halfV, ampH * cg);
-  const p24 = Math.SQRT1_2 * Math.hypot(halfV, ampH * sg);
+  const p13 = Math.hypot(ampH * cg * FIELD_INV_H, ampV * FIELD_INV_V);
+  const p24 = Math.hypot(ampH * sg * FIELD_INV_H, ampV * FIELD_INV_V);
   const pmax = Math.max(p13, p24);
   const s = (pmax > 255) ? (255 / pmax) : 1;
   const H = (ampH * s) * Math.cos(theta);
   const V = (ampV * s) * Math.sin(theta);
-  const k = Math.SQRT1_2;
   return [
-    k * (0.5 * V - H * cg),
-    k * (0.5 * V + H * sg),
-    k * (-0.5 * V - H * cg),
-    k * (-0.5 * V + H * sg)
-  ];
-}
-
-function revolvePairAt(tSec, ampH, ampV, ccw) {
-  const f = Math.max(0.01, +state.freq || 0);
-  let theta = 2 * Math.PI * f * tSec;
-  if (ccw) theta = -theta;
-  const c = Math.cos(theta);
-  const s = Math.sin(theta);
-  const k = Math.SQRT1_2;
-  return [
-    k * (ampV * s - ampH * c),
-    -k * (ampH * c + ampV * s)
+    -H * cg * FIELD_INV_H + V * FIELD_INV_V,
+     H * sg * FIELD_INV_H + V * FIELD_INV_V,
+    -H * cg * FIELD_INV_H - V * FIELD_INV_V,
+     H * sg * FIELD_INV_H - V * FIELD_INV_V
   ];
 }
 
@@ -1517,28 +1503,17 @@ function coilDutyAt(tSec, coilId) {
   }
   const Ah = amp * clampRevPct(state.rev_h) / 100;
   const Av = amp * clampRevPct(state.rev_v) / 100;
-  if (axis === 'tilt') {
-    let t = tSec;
-    if (state.park && state.corner >= 0) {
-      const f = Math.max(0.01, +state.freq || 0);
-      t = ((+state.corner) / 4) / f;
-      const raw = tiltCommandsAt(t, Ah, Av, clampGamma(state.gamma), false);
-      return raw[coilId - 1] || 0;
-    }
-    const raw = tiltCommandsAt(t, Ah, Av, clampGamma(state.gamma), ccw);
+  let gammaDeg = clampGamma(state.gamma);
+  if (axis === 'x') gammaDeg = 0;
+  else if (axis === 'z') gammaDeg = 90;
+  let t = tSec;
+  if (state.park && state.corner >= 0) {
+    t = ((+state.corner) / 4) / f;
+    const raw = tiltCommandsAt(t, Ah, Av, gammaDeg, false);
     return raw[coilId - 1] || 0;
   }
-  const pair = (state.park && state.corner >= 0)
-    ? revolvePairCorner(+state.corner, Ah, Av)
-    : revolvePairAt(tSec, Ah, Av, ccw);
-  if (axis === 'z') {
-    if (coilId === 2) return pair[0];
-    if (coilId === 4) return pair[1];
-    return 0;
-  }
-  if (coilId === 1) return pair[0];
-  if (coilId === 3) return pair[1];
-  return 0;
+  const raw = tiltCommandsAt(t, Ah, Av, gammaDeg, ccw);
+  return raw[coilId - 1] || 0;
 }
 
 /* Unipolar pin duties from bipolar cmd: +duty → RPWM, −duty → LPWM. */
@@ -1644,6 +1619,18 @@ function drawWavePlot() {
   ctx.lineTo(padL + plotW, padT + plotH);
   ctx.stroke();
   ctx.setLineDash([]);
+
+  const mlx = state.mlx;
+  if (mlx && +mlx.ok) {
+    const ctr = mlx.center || mlx;
+    ctx.fillStyle = '#9ecbff';
+    ctx.font = '11px ui-monospace, Menlo, monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(
+      'centre |B| ' + (+ctr.babs).toFixed(2) + ' mT  Bx ' + (+ctr.bx).toFixed(2) +
+        '  By ' + (+ctr.by).toFixed(2) + '  Bz ' + (+ctr.bz).toFixed(2),
+      padL + 8, padT + 14);
+  }
 }
 
 function waveLoop() {

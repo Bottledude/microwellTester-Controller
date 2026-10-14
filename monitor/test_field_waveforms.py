@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Host check of rotate-Y / constant-|B| revolve-X/Z coil currents vs the lab-frame map."""
+"""Host check of rotate-Y / four-coil 30° revolve-X/Z/tilt vs the lab-frame map."""
 from __future__ import annotations
 
 import math
 import sys
 
-SQRT2_2 = math.sqrt(2.0) / 2.0
+CH = math.sqrt(3.0) / 2.0  # cos 30°
+CV = 0.5  # sin 30°
+INV_H = 1.0 / (2.0 * CH)
+INV_V = 1.0 / (4.0 * CV)
 N = 360
-LUT_45 = 45
 LUT_90 = 90
 
 
@@ -37,24 +39,6 @@ def rotate_y(si: int, amp: int, ccw: bool) -> tuple[int, int, int, int]:
     return d13, d24, d13, d24  # M1, M2, M3, M4
 
 
-def sine_scaled_exact(idx: int, amp: int) -> int:
-    """Match firmware sine_scaled_exact() — ±amp at LUT sin = ±1, symmetric ±."""
-    idx = lut_mod(idx)
-    if idx == LUT_90:
-        return amp
-    if idx == LUT_90 + 180:
-        return -amp
-    q15 = int(round(math.sin(2.0 * math.pi * idx / N) * 32767.0))
-    if q15 > 32767:
-        q15 = 32767
-    if q15 < -32767:
-        q15 = -32767
-    if q15 >= 0:
-        return (q15 * amp) >> 15
-    mag = ((-q15) * amp) >> 15
-    return -mag
-
-
 def lut_unit(idx: int) -> float:
     """Match firmware SINE_LUT[i] / 32767."""
     idx = lut_mod(idx)
@@ -76,47 +60,10 @@ def clamp_pwm(v: float) -> int:
     return int(v - 0.5)
 
 
-def revolve_pair(phase: int, amp_h: int, ccw: bool = False, amp_v: int | None = None) -> tuple[int, int]:
-    """Match firmware revolve_pair_currents() (equal Ah=Av uses integer path)."""
-    if amp_v is None:
-        amp_v = amp_h
-    ph = phase & 0xFFFFFFFF
-    if ccw:
-        ph = (-ph) & 0xFFFFFFFF
-    si = lut_from_phase(ph)
-    if amp_h == amp_v:
-        i1 = sine_scaled_exact(si - LUT_45, amp_h)
-        i2 = -sine_scaled_exact(si + LUT_45, amp_h)
-        if i1 > 255:
-            i1 = 255
-        if i1 < -255:
-            i1 = -255
-        if i2 > 255:
-            i2 = 255
-        if i2 < -255:
-            i2 = -255
-        return i1, i2
-    s = lut_unit(si)
-    c = lut_unit(si + LUT_90)
-    i1 = clamp_pwm(SQRT2_2 * (float(amp_v) * s - float(amp_h) * c))
-    i2 = clamp_pwm(-SQRT2_2 * (float(amp_h) * c + float(amp_v) * s))
-    return i1, i2
-
-
-def revolve_z(phase: int, amp: int, ccw: bool) -> tuple[int, int, int, int]:
-    i1, i2 = revolve_pair(phase, amp, ccw)
-    return 0, i1, 0, i2
-
-
-def revolve_x(phase: int, amp: int, ccw: bool) -> tuple[int, int, int, int]:
-    i1, i2 = revolve_pair(phase, amp, ccw)
-    return i1, 0, i2, 0
-
-
 def lab_from_pair(b1: float, b2: float) -> tuple[float, float]:
     """Coil-to-lab map used for both XY (revolve z) and YZ (revolve x)."""
-    horiz = -SQRT2_2 * (b1 + b2)
-    vert = SQRT2_2 * (b1 - b2)
+    horiz = -CH * (b1 + b2)
+    vert = CV * (b1 - b2)
     return horiz, vert
 
 
@@ -134,9 +81,6 @@ def fail(msg: str) -> None:
     sys.exit(1)
 
 
-C = SQRT2_2
-
-
 def tilt_sincos_gamma(deg: float) -> tuple[float, float]:
     if deg <= 0.0:
         return 0.0, 1.0
@@ -147,19 +91,17 @@ def tilt_sincos_gamma(deg: float) -> tuple[float, float]:
 
 
 def tilt_synthesize(H: float, V: float, sg: float, cg: float) -> tuple[float, float, float, float]:
-    hv = 0.5 * V
     return (
-        C * (hv - H * cg),
-        C * (hv + H * sg),
-        C * (-hv - H * cg),
-        C * (-hv + H * sg),
+        -H * cg * INV_H + V * INV_V,
+        H * sg * INV_H + V * INV_V,
+        -H * cg * INV_H - V * INV_V,
+        H * sg * INV_H - V * INV_V,
     )
 
 
 def tilt_shared_scale(ah: float, av: float, sg: float, cg: float, umax: float = 255.0) -> float:
-    half_v = 0.5 * av
-    p13 = C * math.sqrt(half_v * half_v + (ah * cg) ** 2)
-    p24 = C * math.sqrt(half_v * half_v + (ah * sg) ** 2)
+    p13 = math.hypot(ah * cg * INV_H, av * INV_V)
+    p24 = math.hypot(ah * sg * INV_H, av * INV_V)
     pmax = max(p13, p24)
     if pmax <= umax:
         return 1.0
@@ -186,12 +128,26 @@ def tilt_commands_lut(phase: int, amp_h: int, amp_v: int, ccw: bool,
     return (clamp_pwm(raw[0]), clamp_pwm(raw[1]), clamp_pwm(raw[2]), clamp_pwm(raw[3])), scale
 
 
+def revolve_z(phase: int, amp_h: int, ccw: bool = False, amp_v: int | None = None) -> tuple[int, int, int, int]:
+    if amp_v is None:
+        amp_v = amp_h
+    cmd, _ = tilt_commands_lut(phase, amp_h, amp_v, ccw, *tilt_sincos_gamma(90.0))
+    return cmd
+
+
+def revolve_x(phase: int, amp_h: int, ccw: bool = False, amp_v: int | None = None) -> tuple[int, int, int, int]:
+    if amp_v is None:
+        amp_v = amp_h
+    cmd, _ = tilt_commands_lut(phase, amp_h, amp_v, ccw, *tilt_sincos_gamma(0.0))
+    return cmd
+
+
 def check_tilt_mode() -> None:
     A = 100.0
     tol = 1e-4
     sg, cg = tilt_sincos_gamma(0.0)
     raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
-    if any(abs(a - b) > tol for a, b in zip(raw, (-70.710678, 0.0, -70.710678, 0.0))):
+    if any(abs(a - b) > tol for a, b in zip(raw, (-57.735027, 0.0, -57.735027, 0.0))):
         fail(f"python gamma=0 theta=0 commands {raw}")
     bx, by, bz, _ = lab_b_from_coils(*raw)
     if abs(bx) > tol or abs(by) > tol or abs(bz - 100.0) > tol:
@@ -199,7 +155,7 @@ def check_tilt_mode() -> None:
 
     sg, cg = tilt_sincos_gamma(45.0)
     raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
-    if any(abs(a - b) > tol for a, b in zip(raw, (-50.0, 50.0, -50.0, 50.0))):
+    if any(abs(a - b) > 1e-4 for a, b in zip(raw, (-40.824829, 40.824829, -40.824829, 40.824829))):
         fail(f"python gamma=45 theta=0 commands {raw}")
     bx, by, bz, _ = lab_b_from_coils(*raw)
     if abs(bx + 70.710678) > 1e-3 or abs(by) > tol or abs(bz - 70.710678) > 1e-3:
@@ -207,7 +163,7 @@ def check_tilt_mode() -> None:
 
     sg, cg = tilt_sincos_gamma(90.0)
     raw, _ = tilt_commands_exact(A, A, 0.0, 1.0, sg, cg)
-    if any(abs(a - b) > tol for a, b in zip(raw, (0.0, 70.710678, 0.0, 70.710678))):
+    if any(abs(a - b) > tol for a, b in zip(raw, (0.0, 57.735027, 0.0, 57.735027))):
         fail(f"python gamma=90 theta=0 commands {raw}")
     bx, by, bz, _ = lab_b_from_coils(*raw)
     if abs(bx + 100.0) > tol or abs(by) > tol or abs(bz) > tol:
@@ -216,7 +172,7 @@ def check_tilt_mode() -> None:
     for deg in (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0):
         sg, cg = tilt_sincos_gamma(deg)
         raw, _ = tilt_commands_exact(A, A, 1.0, 0.0, sg, cg)
-        if any(abs(a - b) > 1e-4 for a, b in zip(raw, (35.355339, 35.355339, -35.355339, -35.355339))):
+        if any(abs(a - b) > 1e-4 for a, b in zip(raw, (50.0, 50.0, -50.0, -50.0))):
             fail(f"python theta=90 commands at gamma={deg}: {raw}")
         for si in range(0, N, 5):
             ph = (si << 32) // N
@@ -234,7 +190,6 @@ def check_tilt_mode() -> None:
             if abs(babs2 - babs) > 3.0:
                 fail("CCW changed |B|")
 
-    # Reverse phase is not a no-op at a non-cardinal.
     sg, cg = tilt_sincos_gamma(60.0)
     cw, _ = tilt_commands_lut(0x10000000, 80, 80, False, sg, cg)
     ccw, _ = tilt_commands_lut(0x10000000, 80, 80, True, sg, cg)
@@ -245,7 +200,6 @@ def check_tilt_mode() -> None:
     if zcmd != (0, 0, 0, 0):
         fail(f"zero amp LUT commands {zcmd}")
 
-    # Shared scale keeps coils in range when rev_hv would overflow.
     sg, cg = tilt_sincos_gamma(0.0)
     sc = tilt_shared_scale(510.0, 510.0, sg, cg, 255.0)
     if sc >= 1.0:
@@ -254,10 +208,11 @@ def check_tilt_mode() -> None:
     if max(abs(v) for v in raw) > 255.0 + 1e-4:
         fail("shared scale left a coil above Umax")
 
-    # Legacy revolve X/Z still two-coil; tilt gamma=0 uses all four.
-    i1, i2 = revolve_pair(0, 100, False)
-    if tilt_commands_lut(0, 100, 100, False, *tilt_sincos_gamma(0.0))[0] == (i1, 0, i2, 0):
-        fail("tilt gamma=0 should not match legacy two-coil revolve X commands")
+    # X/Z now share the 4-coil synth (gamma 0 / 90).
+    if revolve_x(0, 100)[1] != 0 or revolve_x(0, 100)[3] != 0:
+        fail("revolve x Q0 should leave M2/M4 at 0 (pure H on YZ pair)")
+    if revolve_z(0, 100)[0] != 0 or revolve_z(0, 100)[2] != 0:
+        fail("revolve z Q0 should leave M1/M3 at 0 (pure H on XY pair)")
 
 
 def envelope_amp(live: int, peak: int) -> int:
@@ -293,8 +248,8 @@ def main() -> int:
         bx, by, bz, babs = lab_b_from_coils(m1, m2, m3, m4)
         if abs(by) > 1e-6:
             fail(f"rotate Y By should cancel at si={si}: By={by}")
-        want_bx = -math.sqrt(2.0) * float(m2)
-        want_bz = -math.sqrt(2.0) * float(m1)
+        want_bx = -math.sqrt(3.0) * float(m2)
+        want_bz = -math.sqrt(3.0) * float(m1)
         if abs(bx - want_bx) > 1e-4 or abs(bz - want_bz) > 1e-4:
             fail(f"rotate Y H split at si={si}: Bx,Bz={bx},{bz} want {want_bx},{want_bz}")
         babs_vals.append(babs)
@@ -307,86 +262,77 @@ def main() -> int:
     babs_span = max(babs_vals) - min(babs_vals)
     if babs_span > 8.0:
         fail(f"rotate Y |B| not nearly constant: span {babs_span}")
+    mean_rot = sum(babs_vals) / len(babs_vals)
+    if abs(mean_rot - amp * math.sqrt(3.0)) > 5.0:
+        fail(f"rotate Y |B| mean {mean_rot} want ~{amp * math.sqrt(3.0)}")
 
-    # Cardinals: ±amp/√2, lab order +Bh, +Bv, −Bh, −Bv. |B| ≈ amp.
-    r = int(round(amp * SQRT2_2))
+    # Cardinals via 4-coil synth. Q0 γ=90 is −X (+Bh in tilt frame).
     corners = [
-        (0x00000000, -r, -r, "Bh+"),
-        (0x40000000, r, -r, "Bv+"),
-        (0x80000000, r, r, "Bh-"),
-        (0xC0000000, -r, r, "Bv-"),
+        (0x00000000, "Bh+"),
+        (0x40000000, "Bv+"),
+        (0x80000000, "Bh-"),
+        (0xC0000000, "Bv-"),
     ]
-    signs = []
-    for ph, e1, e2, name in corners:
-        i1, i2 = revolve_pair(ph, amp, False)
-        if abs(i1 - e1) > 2 or abs(i2 - e2) > 2:
-            fail(f"corner {name} currents {i1},{i2} want {e1},{e2}")
-        bh, bv = lab_from_pair(float(i1), float(i2))
-        hs = 1 if bh > 0 else (-1 if bh < 0 else 0)
-        vs = 1 if bv > 0 else (-1 if bv < 0 else 0)
-        signs.append((hs, vs))
-        if abs(math.hypot(bh, bv) - amp) > 3.0:
-            fail(f"corner {name} |B|={math.hypot(bh, bv)} want ~{amp}")
-        m1, m2, m3, m4 = revolve_z(ph, amp, False)
-        if m1 != 0 or m3 != 0:
-            fail(f"revolve z left M1/M3 on at {name}")
-        if abs(m2 - i1) > 0 or abs(m4 - i2) > 0:
-            fail(f"revolve z map at {name}")
-        bx, by, bz, babs = lab_b_from_coils(m1, m2, m3, m4)
-        if abs(bz) > 1e-6:
+    z_signs = []
+    x_signs = []
+    q0_bh = q1_bv = None
+    for ph, name in corners:
+        zcmd = revolve_z(ph, amp, False)
+        bx, by, bz, babs = lab_b_from_coils(*zcmd)
+        if abs(bz) > 1.0:
             fail(f"revolve z Bz should be 0 at {name}: {bz}")
-        if abs(bx - bh) > 1e-4 or abs(by - bv) > 1e-4:
-            fail(f"revolve z Bx,By at {name}: {bx},{by} want {bh},{bv}")
-        if abs(babs - math.hypot(bh, bv)) > 1e-4:
-            fail(f"revolve z |B| at {name}: {babs}")
-        x1, x2, x3, x4 = revolve_x(ph, amp, False)
-        if x2 != 0 or x4 != 0:
-            fail(f"revolve x left M2/M4 on at {name}")
-        if abs(x1 - i1) > 0 or abs(x3 - i2) > 0:
-            fail(f"revolve x map at {name}")
-        xx, xy, xz, xabs = lab_b_from_coils(x1, x2, x3, x4)
-        if abs(xx) > 1e-6:
+        if abs(babs - amp) > 3.0:
+            fail(f"revolve z |B| at {name}: {babs} want ~{amp}")
+        hs = 1 if bx > 2 else (-1 if bx < -2 else 0)
+        vs = 1 if by > 2 else (-1 if by < -2 else 0)
+        z_signs.append((hs, vs))
+        if name == "Bh+":
+            q0_bh = abs(bx)
+        if name == "Bv+":
+            q1_bv = abs(by)
+
+        xcmd = revolve_x(ph, amp, False)
+        xx, xy, xz, xabs = lab_b_from_coils(*xcmd)
+        if abs(xx) > 1.0:
             fail(f"revolve x Bx should be 0 at {name}: {xx}")
-        if abs(xz - bh) > 1e-4 or abs(xy - bv) > 1e-4:
-            fail(f"revolve x Bz,By at {name}: {xz},{xy} want {bh},{bv}")
-        if abs(xabs - math.hypot(bh, bv)) > 1e-4:
+        if abs(xabs - amp) > 3.0:
             fail(f"revolve x |B| at {name}: {xabs}")
+        hs = 1 if xz > 2 else (-1 if xz < -2 else 0)
+        vs = 1 if xy > 2 else (-1 if xy < -2 else 0)
+        x_signs.append((hs, vs))
 
-    if signs != [(1, 0), (0, 1), (-1, 0), (0, -1)]:
-        fail(f"lab cardinal order {signs} want +Bh,+Bv,-Bh,-Bv")
-
-    # Q0.5 (CW): one coil 0, the other −amp. amp=255 hits exactly.
-    i1m, i2m = revolve_pair(0x20000000, 255, False)
-    if i1m != 0 or i2m != -255:
-        fail(f"Q0.5 amp=255 currents {i1m},{i2m} want 0,-255")
-    i1m, i2m = revolve_pair(0x20000000, amp, False)
-    if abs(i1m) > 1 or abs(i2m + amp) > 1:
-        fail(f"Q0.5 currents {i1m},{i2m} want 0,{-amp}")
+    # tilt γ=90: Q0=−X, Q1=+Y, Q2=+X, Q3=−Y
+    if z_signs != [(-1, 0), (0, 1), (1, 0), (0, -1)]:
+        fail(f"revolve z cardinal order {z_signs} want −Bh,+Bv,+Bh,−Bv (tilt Q0=−X)")
+    # tilt γ=0: Q0=+Z, Q1=+Y, Q2=−Z, Q3=−Y
+    if x_signs != [(1, 0), (0, 1), (-1, 0), (0, -1)]:
+        fail(f"revolve x cardinal order {x_signs} want +Bz,+Bv,−Bz,−Bv")
+    if q0_bh is None or q1_bv is None or abs(q0_bh - q1_bv) > 3.0:
+        fail(f"Q0 |Bh|={q0_bh} vs Q1 |Bv|={q1_bv} should match without cutting H")
 
     rev_babs: list[float] = []
     for si in range(0, N, 4):
         ph = (si << 32) // N
-        i1, i2 = revolve_pair(ph, amp, False)
-        bh, bv = lab_from_pair(float(i1), float(i2))
-        rev_babs.append(math.hypot(bh, bv))
+        cmd = revolve_z(ph, amp, False)
+        _, _, _, babs = lab_b_from_coils(*cmd)
+        rev_babs.append(babs)
     if max(rev_babs) - min(rev_babs) > 4.0:
         fail(f"revolve |B| not nearly constant: span {max(rev_babs) - min(rev_babs)}")
     mean_b = sum(rev_babs) / len(rev_babs)
     if abs(mean_b - amp) > 3.0:
         fail(f"revolve |B| mean {mean_b} want ~{amp}")
 
-    # CCW from +Bh goes toward −Bv: I1 more negative, I2 toward 0.
-    i1s, i2s = revolve_pair(0, amp, True)
-    if abs(i1s - (-r)) > 2 or abs(i2s - (-r)) > 2:
-        fail(f"CCW start not +Bh corner: {i1s},{i2s} want {-r},{-r}")
-    step = 32 << 22  # 1/8 of a quadrant
-    i1n, i2n = revolve_pair(step, amp, True)
-    if i1n >= i1s:
-        fail(f"CCW first step I1 should go toward −amp: {i1s} -> {i1n}")
-    if i2n <= i2s:
-        fail(f"CCW first step I2 should go toward 0: {i2s} -> {i2n}")
+    # CCW from Q0 (γ=90, −X) should stay in XY.
+    z0 = revolve_z(0, amp, True)
+    step = 32 << 22
+    z1 = revolve_z(step, amp, True)
+    bx0, by0, bz0, _ = lab_b_from_coils(*z0)
+    bx1, by1, bz1, _ = lab_b_from_coils(*z1)
+    if abs(bz0) > 1.0 or abs(bz1) > 1.0:
+        fail("CCW revolve z left the XY plane")
+    if abs(bx1 - bx0) < 0.5 and abs(by1 - by0) < 0.5:
+        fail("CCW first step did not move the field")
 
-    # Envelope: 0 at live=0, peak at live=peak, concave like sin(π/2 p).
     peak = 200
     if envelope_amp(0, peak) != 0:
         fail("envelope at 0")
@@ -397,35 +343,40 @@ def main() -> int:
     if abs(mid - want) > 2:
         fail(f"envelope mid {mid} want ~{want}")
 
-    # Parked-corner phases (CW stored phase = Q << 30) match the four lab states.
-    park = ((0, -r, -r), (1, r, -r), (2, r, r), (3, -r, r))
-    for q, e1, e2 in park:
-        i1, i2 = revolve_pair(q << 30, amp, False)
-        if abs(i1 - e1) > 2 or abs(i2 - e2) > 2:
-            fail(f"park Q{q} {i1},{i2} want {e1},{e2}")
-        ph_ccw = (-(q << 30)) & 0xFFFFFFFF
-        j1, j2 = revolve_pair(ph_ccw, amp, True)
-        if abs(j1 - e1) > 2 or abs(j2 - e2) > 2:
-            fail(f"park Q{q} CCW-encoded {j1},{j2} want {e1},{e2}")
-
-    # Ah=amp/4, Av=amp: Q0 |Bh|≈Ah, Q1 |Bv|≈Av (H cut 4× vs equal circle).
+    # Ah=amp/4, Av=amp: Q0 |Bh|≈Ah, Q1 |Bv|≈Av
     ah, av = amp // 4, amp
-    i1, i2 = revolve_pair(0, ah, False, av)
-    bh, bv = lab_from_pair(float(i1), float(i2))
-    if abs(bv) > 2.0 or abs(abs(bh) - ah) > 3.0:
-        fail(f"ellipse Q0 Bh,Bv={bh},{bv} want |Bh|~{ah}, Bv~0")
-    i1, i2 = revolve_pair(0x40000000, ah, False, av)
-    bh, bv = lab_from_pair(float(i1), float(i2))
-    if abs(bh) > 2.0 or abs(abs(bv) - av) > 3.0:
-        fail(f"ellipse Q1 Bh,Bv={bh},{bv} want Bh~0, |Bv|~{av}")
-    if abs(ah * 4 - av) > 1:
-        fail("test amp not 4:1")
+    z0 = revolve_z(0, ah, False, av)
+    bx, by, _, _ = lab_b_from_coils(*z0)
+    if abs(by) > 2.0 or abs(abs(bx) - ah) > 3.0:
+        fail(f"ellipse Q0 Bx,By={bx},{by} want |Bx|~{ah}, By~0")
+    z1 = revolve_z(0x40000000, ah, False, av)
+    bx, by, _, _ = lab_b_from_coils(*z1)
+    if abs(bx) > 2.0 or abs(abs(by) - av) > 3.0:
+        fail(f"ellipse Q1 Bx,By={bx},{by} want Bx~0, |By|~{av}")
 
-    print("ok: rotate Y pairing + lab B, constant-|B| revolve corners + Q0.5 + CCW")
-    print("ok: rev_hv Ah/Av ellipse (H 4x smaller at Q0 vs Q1)")
+    print("ok: rotate Y pairing + lab B (30 deg, |B|~amp*sqrt(3))")
+    print("ok: 4-coil revolve X/Z constant |B|, Q0|Bh|=Q1|Bv|, ellipse")
 
     check_tilt_mode()
     print("ok: tilted-axis revolve LUT path + reference vectors + Bn=0")
+
+    # Reconstruct: B_i = u_i * coil_axis → forward(u) matches lab_b_from_coils(u)
+    axes = (
+        (0.0, CV, -CH),
+        (-CH, CV, 0.0),
+        (0.0, -CV, -CH),
+        (-CH, -CV, 0.0),
+    )
+    raw, _ = tilt_commands_exact(80.0, 80.0, 0.6, 0.8, *tilt_sincos_gamma(30.0))
+    bx, by, bz, _ = lab_b_from_coils(*raw)
+    uhat = []
+    for i, ax in enumerate(axes):
+        bi = (raw[i] * ax[0], raw[i] * ax[1], raw[i] * ax[2])
+        uhat.append(bi[0] * ax[0] + bi[1] * ax[1] + bi[2] * ax[2])
+    rx, ry, rz, _ = lab_b_from_coils(*uhat)
+    if abs(rx - bx) > 1e-4 or abs(ry - by) > 1e-4 or abs(rz - bz) > 1e-4:
+        fail(f"reconstruct {rx},{ry},{rz} vs {bx},{by},{bz}")
+    print("ok: centre reconstruction from coil-axis projections")
     return 0
 
 

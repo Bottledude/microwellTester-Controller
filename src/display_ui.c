@@ -126,12 +126,13 @@ void DisplayUI_Update(const char *mode, uint8_t contour,
     uint16_t fg;
     int i = n;
     if (mlx && mlx->present) {
-      snprintf(line, sizeof(line), "B%+.1f%+.1f%+.1f%s",
+      snprintf(line, sizeof(line), "B%+.1f%+.1f%+.1f %u/4%s",
                (double)mlx->bx_mt, (double)mlx->by_mt, (double)mlx->bz_mt,
-               mlx->sat ? "!" : " ");
+               (unsigned)mlx->n_present,
+               mlx->sat ? "!" : "");
       fg = mlx->sat ? ST7735_ORANGE : ST7735_GRAY;
     } else {
-      snprintf(line, sizeof(line), "mlx --");
+      snprintf(line, sizeof(line), "mlx 0/4");
       fg = ST7735_GRAY;
     }
     if (i < MAX_ROWS && (strcmp(line, s_rows[i].line) != 0 || fg != s_rows[i].fg)) {

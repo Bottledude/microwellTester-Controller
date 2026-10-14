@@ -50,8 +50,8 @@ static void check_reference_vectors(void)
 
   gamma_of(0.0f, &sg, &cg);
   field_tilt_commands(A, A, 0.0f, 1.0f, sg, cg, 255.0f, raw, NULL);
-  expect(nearly(raw[0], -70.710678f, tol) && nearly(raw[1], 0.0f, tol) &&
-             nearly(raw[2], -70.710678f, tol) && nearly(raw[3], 0.0f, tol),
+  expect(nearly(raw[0], -57.735027f, tol) && nearly(raw[1], 0.0f, tol) &&
+             nearly(raw[2], -57.735027f, tol) && nearly(raw[3], 0.0f, tol),
          "gamma=0 theta=0 commands");
   field_tilt_forward(raw, &bx, &by, &bz);
   expect(nearly(bx, 0.0f, tol) && nearly(by, 0.0f, tol) &&
@@ -60,8 +60,8 @@ static void check_reference_vectors(void)
 
   gamma_of(45.0f, &sg, &cg);
   field_tilt_commands(A, A, 0.0f, 1.0f, sg, cg, 255.0f, raw, NULL);
-  expect(nearly(raw[0], -50.0f, tol) && nearly(raw[1], 50.0f, tol) &&
-             nearly(raw[2], -50.0f, tol) && nearly(raw[3], 50.0f, tol),
+  expect(nearly(raw[0], -40.824829f, tol) && nearly(raw[1], 40.824829f, tol) &&
+             nearly(raw[2], -40.824829f, tol) && nearly(raw[3], 40.824829f, tol),
          "gamma=45 theta=0 commands");
   field_tilt_forward(raw, &bx, &by, &bz);
   expect(nearly(bx, -70.710678f, tol) && nearly(by, 0.0f, tol) &&
@@ -70,8 +70,8 @@ static void check_reference_vectors(void)
 
   gamma_of(90.0f, &sg, &cg);
   field_tilt_commands(A, A, 0.0f, 1.0f, sg, cg, 255.0f, raw, NULL);
-  expect(nearly(raw[0], 0.0f, tol) && nearly(raw[1], 70.710678f, tol) &&
-             nearly(raw[2], 0.0f, tol) && nearly(raw[3], 70.710678f, tol),
+  expect(nearly(raw[0], 0.0f, tol) && nearly(raw[1], 57.735027f, tol) &&
+             nearly(raw[2], 0.0f, tol) && nearly(raw[3], 57.735027f, tol),
          "gamma=90 theta=0 commands");
   field_tilt_forward(raw, &bx, &by, &bz);
   expect(nearly(bx, -100.0f, tol) && nearly(by, 0.0f, tol) &&
@@ -84,8 +84,8 @@ static void check_reference_vectors(void)
     for (i = 0; i < 7; i++) {
       gamma_of(gs[i], &sg, &cg);
       field_tilt_commands(A, A, 1.0f, 0.0f, sg, cg, 255.0f, raw, NULL);
-      expect(nearly(raw[0], 35.355339f, tol) && nearly(raw[1], 35.355339f, tol) &&
-                 nearly(raw[2], -35.355339f, tol) && nearly(raw[3], -35.355339f, tol),
+      expect(nearly(raw[0], 50.0f, tol) && nearly(raw[1], 50.0f, tol) &&
+                 nearly(raw[2], -50.0f, tol) && nearly(raw[3], -50.0f, tol),
              "any gamma theta=90 commands");
       field_tilt_forward(raw, &bx, &by, &bz);
       expect(nearly(bx, 0.0f, tol) && nearly(by, 100.0f, tol) &&
@@ -332,7 +332,8 @@ static void check_quantized_field_bound(void)
   int16_t cmd[4];
   float u[4];
   const float A = 100.0f;
-  const float c = FIELD_TILT_C;
+  const float ch = FIELD_CH;
+  const float cv = FIELD_CV;
   int si;
 
   gamma_of(45.0f, &sg, &cg);
@@ -356,12 +357,36 @@ static void check_quantized_field_bound(void)
       float ex = fabsf(bx - (-H * sg));
       float ey = fabsf(by - V);
       float ez = fabsf(bz - (H * cg));
-      if (ex > c + 1e-3f || ez > c + 1e-3f || ey > 2.0f * c + 1e-3f) {
-        fail("quantized forward error exceeds c / 2c bound");
+      if (ex > ch + 1e-3f || ez > ch + 1e-3f || ey > 2.0f * cv + 1e-3f) {
+        fail("quantized forward error exceeds c_h / 2 c_v bound");
         return;
       }
     }
   }
+}
+
+static void check_reconstruct(void)
+{
+  float sg, cg, raw[4], bx, by, bz, rx, ry, rz;
+  float b_lab[4][3];
+  float k[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  uint8_t present[4] = {1, 1, 1, 1};
+  const float A = 80.0f;
+  int i;
+
+  gamma_of(30.0f, &sg, &cg);
+  field_tilt_commands(A, A, 0.6f, 0.8f, sg, cg, 255.0f, raw, NULL);
+  field_tilt_forward(raw, &bx, &by, &bz);
+  for (i = 0; i < 4; i++) {
+    float ax[3];
+    field_tilt_coil_axis((uint8_t)i, ax);
+    b_lab[i][0] = raw[i] * ax[0];
+    b_lab[i][1] = raw[i] * ax[1];
+    b_lab[i][2] = raw[i] * ax[2];
+  }
+  field_tilt_reconstruct_center(b_lab, k, present, &rx, &ry, &rz);
+  expect(nearly(rx, bx, 1e-4f) && nearly(ry, by, 1e-4f) && nearly(rz, bz, 1e-4f),
+         "reconstruct from coil-axis projections matches forward");
 }
 
 int main(void)
@@ -378,6 +403,7 @@ int main(void)
   check_endpoint_planes();
   check_coherent_coeffs();
   check_quantized_field_bound();
+  check_reconstruct();
 
   if (g_fails) {
     fprintf(stderr, "%d check(s) failed\n", g_fails);

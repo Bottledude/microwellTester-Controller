@@ -1,6 +1,7 @@
 /**
  * @file mlx90393.h
  * @brief MLX90393 3-axis magnetometer on a dedicated I2C bus (not PCA9685).
+ * Firmware polls up to four chips (one behind each coil).
  *
  * Burst/single-measurement XYZ in mT. Axis remap is applied by the caller.
  */

@@ -1,6 +1,6 @@
 /**
  * @file field_tilt.c
- * @brief Tilted-axis four-coil inverse (equal vertical split).
+ * @brief Tilted-axis four-coil inverse (30° tilt, equal vertical split).
  */
 #include "field_tilt.h"
 
@@ -55,11 +55,12 @@ void field_tilt_coeffs_from_deg(float gamma_deg, FieldTiltCoeffs *out)
 float field_tilt_shared_scale(float ah, float av, float sin_g, float cos_g,
                               float umax)
 {
-  float half_v = 0.5f * av;
-  float t13 = half_v * half_v + (ah * cos_g) * (ah * cos_g);
-  float t24 = half_v * half_v + (ah * sin_g) * (ah * sin_g);
-  float p13 = FIELD_TILT_C * sqrtf(t13);
-  float p24 = FIELD_TILT_C * sqrtf(t24);
+  float inv_h = 1.0f / (2.0f * FIELD_CH);
+  float inv_v = 1.0f / (4.0f * FIELD_CV);
+  float p13 = sqrtf((ah * cos_g * inv_h) * (ah * cos_g * inv_h) +
+                    (av * inv_v) * (av * inv_v));
+  float p24 = sqrtf((ah * sin_g * inv_h) * (ah * sin_g * inv_h) +
+                    (av * inv_v) * (av * inv_v));
   float pmax = (p13 > p24) ? p13 : p24;
 
   if (!(umax > 0.0f) || !(pmax > umax)) return 1.0f;
@@ -69,18 +70,16 @@ float field_tilt_shared_scale(float ah, float av, float sin_g, float cos_g,
 void field_tilt_synthesize(float H, float V, float sin_g, float cos_g,
                            float raw[4])
 {
-  float half_v;
-  float hcg;
-  float hsg;
+  float inv_h;
+  float inv_v;
 
   if (!raw) return;
-  half_v = 0.5f * V;
-  hcg = H * cos_g;
-  hsg = H * sin_g;
-  raw[0] = FIELD_TILT_C * ( half_v - hcg); /* M1 */
-  raw[1] = FIELD_TILT_C * ( half_v + hsg); /* M2 */
-  raw[2] = FIELD_TILT_C * (-half_v - hcg); /* M3 */
-  raw[3] = FIELD_TILT_C * (-half_v + hsg); /* M4 */
+  inv_h = 1.0f / (2.0f * FIELD_CH);
+  inv_v = 1.0f / (4.0f * FIELD_CV);
+  raw[0] = -H * cos_g * inv_h + V * inv_v; /* M1 */
+  raw[1] =  H * sin_g * inv_h + V * inv_v; /* M2 */
+  raw[2] = -H * cos_g * inv_h - V * inv_v; /* M3 */
+  raw[3] =  H * sin_g * inv_h - V * inv_v; /* M4 */
 }
 
 void field_tilt_quantize(const float raw[4], int16_t cmd[4], int16_t umax)
@@ -109,16 +108,63 @@ void field_tilt_quantize(const float raw[4], int16_t cmd[4], int16_t umax)
 
 void field_tilt_forward(const float u[4], float *bx, float *by, float *bz)
 {
-  float c = FIELD_TILT_C;
   float x, y, z;
 
   if (!u) return;
-  x = -c * (u[1] + u[3]);
-  y =  c * (u[0] + u[1] - u[2] - u[3]);
-  z = -c * (u[0] + u[2]);
+  x = -FIELD_CH * (u[1] + u[3]);
+  y =  FIELD_CV * (u[0] + u[1] - u[2] - u[3]);
+  z = -FIELD_CH * (u[0] + u[2]);
   if (bx) *bx = x;
   if (by) *by = y;
   if (bz) *bz = z;
+}
+
+void field_tilt_coil_axis(uint8_t coil, float axis[3])
+{
+  if (!axis) return;
+  switch (coil) {
+    case 0:
+      axis[0] = 0.0f;
+      axis[1] = FIELD_CV;
+      axis[2] = -FIELD_CH;
+      break;
+    case 1:
+      axis[0] = -FIELD_CH;
+      axis[1] = FIELD_CV;
+      axis[2] = 0.0f;
+      break;
+    case 2:
+      axis[0] = 0.0f;
+      axis[1] = -FIELD_CV;
+      axis[2] = -FIELD_CH;
+      break;
+    default:
+      axis[0] = -FIELD_CH;
+      axis[1] = -FIELD_CV;
+      axis[2] = 0.0f;
+      break;
+  }
+}
+
+void field_tilt_reconstruct_center(const float b_lab[4][3], const float k[4],
+                                   const uint8_t present[4],
+                                   float *bx, float *by, float *bz)
+{
+  float u[4];
+  int i;
+
+  u[0] = u[1] = u[2] = u[3] = 0.0f;
+  if (b_lab) {
+    for (i = 0; i < 4; i++) {
+      float ax[3], ki, dot;
+      if (present && !present[i]) continue;
+      field_tilt_coil_axis((uint8_t)i, ax);
+      ki = (k && k[i] != 0.0f) ? k[i] : 1.0f;
+      dot = b_lab[i][0] * ax[0] + b_lab[i][1] * ax[1] + b_lab[i][2] * ax[2];
+      u[i] = dot / ki;
+    }
+  }
+  field_tilt_forward(u, bx, by, bz);
 }
 
 void field_tilt_commands(float ah, float av, float sin_th, float cos_th,
