@@ -218,6 +218,34 @@ mlx k all 1
 mlx offset
 ```
 
+### DualSense pad (laptop → USART1)
+
+The DualSense stays on the **PC** (Bluetooth or USB). A host script maps buttons/sticks to the same CLI and writes them to the Serial Monitor UART. The H743 is not a USB-HID host — do not plug the pad into the STM32.
+
+```text
+pip install -r monitor/requirements-gamepad.txt
+python monitor/dualsense_field.py --list          # serial ports
+python monitor/dualsense_field.py --port COM9     # USART1 / ST-Link VCP; not DualSense Bluetooth COM ports
+python monitor/dualsense_field.py --dry-run       # pad only, no UART
+```
+
+This process **owns USART1**. Close `pio device monitor` and Teleplot on that port first (they cannot share the COM port). USART3 / the ESP32 web UI can stay connected.
+
+| Pad | CLI |
+|-----|-----|
+| D-pad Up / Left / Right / Down | `axis y` / `x` / `z` / `tilt` |
+| Options | START (`rotate on` or `revolve <axis>`) |
+| Create | STOP (`rotate off`) |
+| PS | `off all` (immediate) |
+| L1 / R1 | `rot_dir ccw` / `cw` |
+| □ / ✕ / ○ / △ | `corner Q0` / `Q1` / `Q2` / `Q3` |
+| Left stick X | `gamma 0..90` (5° steps; rest holds) |
+| Right stick X | `amp 0..255` (rest holds) |
+| Right stick Y | slew `freq` |
+| Touchpad click | `status` |
+
+If face buttons are swapped, pass `--layout sony`. `--debug` prints raw button numbers. Changing `gamma` / program while the field is on still ramps amp through 0.
+
 ### Waveform observe (Teleplot)
 
 Install the [Teleplot](https://marketplace.visualstudio.com/items?itemName=alexnesnes.teleplot) extension (`alexnesnes.teleplot`). Cursor often does not list it in the marketplace UI — download the `.vsix` and install it:
@@ -345,6 +373,8 @@ If a reading saturates a chip, lower `amp`. `rev_hv` still trims the commanded e
 │   ├── st7735.c            # SPI4 + ST7735
 │   └── display_ui.c        # Status screen (~10 Hz)
 ├── monitor/
+│   ├── dualsense_field.py
+│   ├── requirements-gamepad.txt
 │   ├── test_field_waveforms.py
 │   ├── test_field_tilt.c
 │   └── run_field_tests.sh
