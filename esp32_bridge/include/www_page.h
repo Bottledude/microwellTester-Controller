@@ -620,7 +620,7 @@ async function sendRawCmd() {
 }
 
 async function allOff() {
-  await sendCmd('rotate off');
+  /* off all already stops the AC field; no ramped rotate off round trip first. */
   await sendCmd('off all');
 }
 

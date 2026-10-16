@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import math
+import re
 import sys
+from pathlib import Path
 
 CH = math.sqrt(3.0) / 2.0  # cos 30°
 CV = 0.5  # sin 30°
@@ -230,7 +232,39 @@ def envelope_amp(live: int, peak: int) -> int:
     return s
 
 
+def check_firmware_constants() -> None:
+    """The Python model must use the firmware's LUT and coil tilt, not a copy."""
+    root = Path(__file__).resolve().parent.parent
+    main_c = (root / "src" / "main.c").read_text(encoding="utf-8")
+    hdr = (root / "include" / "field_tilt.h").read_text(encoding="utf-8")
+
+    m = re.search(r"#define\s+SINE_LUT_SIZE\s+(\d+)", main_c)
+    if not m or int(m.group(1)) != N:
+        fail(f"SINE_LUT_SIZE in main.c != {N}")
+    m = re.search(r"#define\s+SINE_LUT_90\s+(\d+)u?", main_c)
+    if not m or int(m.group(1)) != LUT_90:
+        fail(f"SINE_LUT_90 in main.c != {LUT_90}")
+    m = re.search(r"SINE_LUT\[SINE_LUT_SIZE\]\s*=\s*\{([^}]*)\}", main_c)
+    if not m:
+        fail("SINE_LUT table not found in main.c")
+    fw = [int(v) for v in m.group(1).replace("\n", " ").split(",") if v.strip()]
+    if len(fw) != N:
+        fail(f"SINE_LUT has {len(fw)} entries, want {N}")
+    for i, v in enumerate(fw):
+        want = int(round(lut_unit(i) * 32767.0))
+        if v != want:
+            fail(f"SINE_LUT[{i}]={v} but Python model uses {want}")
+
+    for name, want in (("FIELD_CH", CH), ("FIELD_CV", CV)):
+        m = re.search(rf"#define\s+{name}\s+([0-9.]+)f", hdr)
+        if not m or abs(float(m.group(1)) - want) > 1e-7:
+            fail(f"{name} in field_tilt.h does not match Python {want}")
+
+
 def main() -> int:
+    check_firmware_constants()
+    print("ok: Python model matches firmware SINE_LUT and 30 deg tilt constants")
+
     amp = 180
 
     babs_vals: list[float] = []

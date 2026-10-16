@@ -53,7 +53,7 @@ static String stm32TransactionOnce(const String &cmd, uint32_t timeout_ms)
   StmSerial.flush();
 
   const bool wantJson = (cmd.indexOf("json") >= 0);
-  const bool mlxCal = (cmd.indexOf("mlx cal") >= 0);
+  const bool mlxCal = (cmd.indexOf("mlx offset") >= 0);
   const uint32_t idle_ms = wantJson ? 250U : (mlxCal ? 500U : 120U);
 
   String acc;
@@ -202,6 +202,13 @@ static void handleCmd()
 
   String cmd = body["cmd"].as<String>();
   cmd.trim();
+  /* One CLI line per request: an embedded CR/LF would run extra commands,
+   * and the STM32 drops chars past CLI_LINE_MAX-1 (127), running a cut line. */
+  if (cmd.length() == 0 || cmd.length() > 127 ||
+      cmd.indexOf('\r') >= 0 || cmd.indexOf('\n') >= 0) {
+    server.send(400, "text/plain", "cmd must be one line, 1..127 chars");
+    return;
+  }
   uint32_t to = STM32_CMD_TIMEOUT_MS;
   String raw = stm32Transaction(cmd, to);
   int score = asciiScore(raw);

@@ -357,7 +357,6 @@ static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_TIM6_Init(void);
-static void Mlx_ApplySample(const MlxSample *s);
 static void Mlx_PrintStatus(void);
 static void PCA9685_Init(void);
 static void PCA9685_Flush(void);
@@ -1122,9 +1121,11 @@ static void Coil_ApplyOutputs(uint8_t idx)
   const CoilHw *hw = &COIL_HW[idx];
   CoilState *st = &coils[idx];
 
+  /* duty_applied is authoritative: 0 from the soft limit or PI means off,
+   * not "fall back to magnitude". Enable paths seed it in open mode. */
   uint16_t duty = 0;
   if (st->enabled && st->magnitude > 0) {
-    duty = st->duty_applied ? st->duty_applied : st->magnitude;
+    duty = st->duty_applied;
   }
 
   if (!st->enabled || duty == 0) {
@@ -1490,6 +1491,7 @@ static void Rotate_Stop(void)
   Revolve_ClearPark();
   g_rotate_dir = g_rotate_dir_want;
   g_field_prog = g_field_prog_want;
+  Tilt_CommitGamma(g_tilt_gamma_want); /* idle gamma applies at once, like dir/program */
 
   int n = (NUM_COILS < NUM_ROTATE_COILS) ? NUM_COILS : NUM_ROTATE_COILS;
   for (int i = 0; i < n; i++) {
@@ -1980,16 +1982,6 @@ static uint8_t mlx_avg_lab_coil(uint8_t coil, int n, float lab_mt[3])
   return 1;
 }
 
-static void mlx_all_coils_off(void)
-{
-  int i;
-  for (i = 0; i < NUM_COILS; i++) {
-    coils[i].enabled = 0;
-    Coil_ApplySignedDuty((uint8_t)i, 0);
-  }
-  PCA9685_Flush();
-}
-
 static void Mlx_PrintStatus(void)
 {
   int i;
@@ -2021,7 +2013,7 @@ static uint8_t mlx_take_offset(void)
 {
   int i;
   uint8_t ok = 0;
-  mlx_all_coils_off();
+  Coil_AllOff(); /* keeps each coil's DC dir; also clears contour */
   HAL_Delay(MLX_CAL_SETTLE_MS);
   for (i = 0; i < NUM_COILS; i++) {
     float raw[3];
@@ -2087,22 +2079,30 @@ static void mlx_try_init(void)
 
 static void Mlx_PollAll(void)
 {
+  static uint32_t start_ms;
   int i;
-  for (i = 0; i < NUM_COILS; i++) {
-    if (!g_mlx_coil[i].present) continue;
-    if (!g_mlx_coil[i].sm_tick) {
-      (void)MLX90393_StartMeasure(&g_mlx_coil[i]);
-    }
-  }
+  uint8_t fresh = 0;
+  uint32_t now = HAL_GetTick();
   for (i = 0; i < NUM_COILS; i++) {
     MlxSample s;
     if (!g_mlx_coil[i].present) continue;
     if (MLX90393_ReadIfReady(&g_mlx_coil[i], &s)) {
       Mlx_ApplyCoilSample((uint8_t)i, &s);
-      (void)MLX90393_StartMeasure(&g_mlx_coil[i]);
+      fresh = 1;
     }
   }
-  Mlx_ReconstructCenter();
+  /* Start conversions at MLX_POLL_HZ, not every loop pass: less I2C2 time
+   * between PCA flushes. Display/json/Teleplot read at <= 50 Hz anyway. */
+  if ((now - start_ms) >= (1000u / MLX_POLL_HZ)) {
+    start_ms = now;
+    for (i = 0; i < NUM_COILS; i++) {
+      if (g_mlx_coil[i].present && !g_mlx_coil[i].sm_tick) {
+        (void)MLX90393_StartMeasure(&g_mlx_coil[i]);
+      }
+    }
+  }
+  /* Main loop spins far faster than conversions; rebuild only on new data. */
+  if (fresh) Mlx_ReconstructCenter();
 }
 
 static void CLI_PrintHelp(void)

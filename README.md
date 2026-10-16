@@ -170,7 +170,7 @@ WiFi SSID/password and UART pins: `esp32_bridge/include/config.h` (`NUM_COILS` i
    - **Field** — Rotate Y / Revolve X / Revolve Z / Revolve tilt, START/STOP, freq/amp, γ, CW/CCW, soft limit, MLX scan/offset. Canvas is a **math preview** of the commanded waveform (bipolar signed duty, or unipolar RPWM/LPWM). Last `json` sample shows live `signed` / `pr` / `pl` and reconstructed `mlx.center` mT. For a live scope, use Teleplot on STM32 USART1 (below) — not the ESP32 UART.
    - **DC coils** — per-coil constant drive, contour, program P1/P2. All four lock while the AC field is on (STOP first).
    - **Logs** — command traffic + raw CLI
-4. Field **STOP** sends `rotate off` (amp fades; also stops revolve). Header **ALL OFF** sends `rotate off` then `off all` — **`off all` cuts immediately**.
+4. Field **STOP** sends `rotate off` (amp fades; also stops revolve). Header **ALL OFF** sends `off all` only — it **cuts immediately** and also stops the AC field.
 5. Link pill is **linked** only after a parsed `json` coil snapshot. Ping-only shows **UART up · status stale**.
 
 ## Serial CLI (STM32)

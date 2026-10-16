@@ -291,6 +291,7 @@ class Pad:
         self._gamma = 45.0
         self._amp: int | None = None
         self._freq = 1.0
+        self._freq_sent: float | None = None
 
     def pump(self) -> None:
         _import_pygame().event.pump()
@@ -430,9 +431,22 @@ class Pad:
             q = round(self._freq * 4.0) / 4.0
             if q < FREQ_MIN:
                 q = FREQ_MIN
-            out.append((f"freq {q:.2f}", False))
+            if q != self._freq_sent:
+                self._freq_sent = q
+                out.append((f"freq {q:.2f}", False))
 
         return out
+
+
+def enqueue(pending: list[tuple[str, bool]], new: list[tuple[str, bool]]) -> None:
+    """Queue commands. Newest non-urgent verb wins; urgent drops older queue."""
+    for cmd, urgent in new:
+        if urgent:
+            pending.clear()
+        else:
+            verb = cmd.split()[0]
+            pending[:] = [p for p in pending if p[1] or p[0].split()[0] != verb]
+        pending.append((cmd, urgent))
 
 
 def print_map() -> None:
@@ -496,16 +510,12 @@ def main(argv: list[str] | None = None) -> int:
             now = time.monotonic()
             dt = now - last
             last = now
-            pending.extend(pad.collect(dt, args.debug))
+            enqueue(pending, pad.collect(dt, args.debug))
             pending.sort(key=lambda t: 0 if t[1] else 1)
             if pending:
                 cmd, urgent = pending[0]
                 if cli.send(cmd, urgent=urgent):
                     pending.pop(0)
-                    verb = cmd.split()[0]
-                    pending[:] = [
-                        p for p in pending if p[1] or p[0].split()[0] != verb
-                    ]
             time.sleep(POLL_S)
     except KeyboardInterrupt:
         print("\nexit")
