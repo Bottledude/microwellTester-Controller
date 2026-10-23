@@ -1,12 +1,8 @@
 {
   "folders": [
     {
-      "name": "STM32 H743",
+      "name": "ESP32 coil driver",
       "path": "."
-    },
-    {
-      "name": "ESP32 Bridge",
-      "path": "esp32_bridge"
     }
   ],
   "settings": {

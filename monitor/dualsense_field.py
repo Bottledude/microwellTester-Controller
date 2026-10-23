@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Drive the STM32 coil CLI from a DualSense on this PC (USB or Bluetooth).
+"""Optional UART0 DualSense mapper (laptop HID host).
 
-The pad never talks to the H743 directly. This process is the HID host and
-writes the same USART1 commands as the Serial Monitor.
+The ESP32 firmware pairs a DualSense over Bluetooth Classic by itself.
+Use this script only as a UART0 fallback: this process is the HID host and
+writes the same CLI commands as the Serial Monitor.
 
   pip install -r monitor/requirements-gamepad.txt
   python monitor/dualsense_field.py --list
@@ -10,9 +11,9 @@ writes the same USART1 commands as the Serial Monitor.
   python monitor/dualsense_field.py --dry-run
 
 This script owns the Serial Monitor port. Close pio device monitor / Teleplot
-on USART1 first. ESP32 USART3 can stay up in parallel.
+on UART0 first.
 
-Mapping (firmware γ is the field axis in XZ, 0–90°; changes while running
+Mapping (firmware γ is the field axis in XZ, 0–180°; changes while running
 ramp amp through 0 — analog values are quantized and sent only on change):
 
   D-pad Up/Left/Right/Down   axis y / x / z / tilt
@@ -21,7 +22,7 @@ ramp amp through 0 — analog values are quantized and sent only on change):
   PS                         ALL OFF (off all — immediate)
   L1 / R1                    rot_dir ccw / cw
   Square / Cross / Circle / Triangle   corner Q0 / Q1 / Q2 / Q3
-  Left stick X               gamma 0..90 (deadzone holds last)
+  Left stick X               gamma 0..180 (deadzone holds last)
   Right stick X              amp 0..255 (deadzone holds last)
   Right stick Y              slew freq while held
   Touchpad click             status
@@ -54,11 +55,12 @@ PAD_HINTS = (
     "playstation",
 )
 PORT_HINTS = (
-    "stmicro",
-    "stm32",
-    "weact",
-    "ch340",
+    "espressif",
+    "esp32",
+    "silicon labs",
     "cp210",
+    "ch340",
+    "wch",
     "usb serial",
     "usb-serial",
     "usb uart",
@@ -154,12 +156,12 @@ def pick_serial_port(explicit: str | None) -> str:
     if explicit:
         return explicit
     if not ports:
-        raise SystemExit("No serial ports. Plug in the H743 USB-UART or pass --port.")
+        raise SystemExit("No serial ports. Plug in the ESP32 USB-UART or pass --port.")
     scored = sorted(((_port_score(p), p) for p in ports), key=lambda t: t[0], reverse=True)
     best_score, best = scored[0]
     if best_score <= 0:
-        print("Could not auto-pick the STM32 USART1 adapter.")
-        print("DualSense Bluetooth often appears as extra COM ports - those are not the H743.\n")
+        print("Could not auto-pick the ESP32 UART0 adapter.")
+        print("DualSense Bluetooth often appears as extra COM ports - those are not the ESP32 UART0.\n")
         print_ports()
         raise SystemExit("Pass --port COMx for the USB-UART Serial Monitor.")
     return best.device
@@ -175,11 +177,11 @@ def print_ports() -> None:
         note = ""
         blob = _port_blob(p)
         if "bluetooth" in blob or "bthenum" in blob:
-            note = "  (Bluetooth SPP - not STM32 USART1)"
+            note = "  (Bluetooth SPP - not ESP32 UART0)"
         print(f"  {p.device:12}  {p.description}{note}")
 
 
-class Stm32Cli:
+class Esp32Cli:
     def __init__(self, port: str | None, baud: int, dry: bool) -> None:
         self.dry = dry
         self._ser = None
@@ -196,7 +198,7 @@ class Stm32Cli:
         self._ser.reset_input_buffer()
         self._rx_thr = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thr.start()
-        print(f"USART1 {port} @ {baud}")
+        print(f"UART0 {port} @ {baud}")
         self.send("ping", urgent=True)
         time.sleep(0.2)
 
@@ -216,7 +218,7 @@ class Stm32Cli:
                 line, buf = buf.split("\n", 1)
                 line = line.strip("\r")
                 if line:
-                    print(f"  stm32< {line}")
+                    print(f"  esp32< {line}")
 
     def send(self, cmd: str, urgent: bool = False) -> bool:
         cmd = cmd.strip()
@@ -399,12 +401,12 @@ class Pad:
 
         lx = self._axis(0)
         if abs(lx) >= DEAD:
-            g = (lx + 1.0) * 45.0
+            g = (lx + 1.0) * 90.0
             g = round(g / GAMMA_STEP) * GAMMA_STEP
             if g < 0.0:
                 g = 0.0
-            if g > 90.0:
-                g = 90.0
+            if g > 180.0:
+                g = 180.0
             if abs(g - self._gamma) >= (GAMMA_STEP - 0.01):
                 self._gamma = g
                 out.append((f"gamma {g:.0f}", False))
@@ -462,7 +464,7 @@ Controls
   PS            ALL OFF    off all (immediate)
   L1 / R1       rot_dir    ccw / cw
   □ / ✕ / ○ / △  corner    Q0 / Q1 / Q2 / Q3
-  Left stick X  gamma      0° … 90°  (rest = hold)
+  Left stick X  gamma      0° … 180°  (rest = hold)
   Right stick X amp        0 … 255   (rest = hold)
   Right stick Y freq       slew 0.01–50 Hz
   Touchpad      status
@@ -472,7 +474,7 @@ Controls
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
-    ap.add_argument("--port", help="USART1 COM port (auto if omitted)")
+    ap.add_argument("--port", help="UART0 COM port (auto if omitted)")
     ap.add_argument("--baud", type=int, default=BAUD)
     ap.add_argument("--list", action="store_true", help="list serial ports and exit")
     ap.add_argument("--dry-run", action="store_true", help="print CLI, do not open serial")
@@ -500,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         print_ports()
         print(f"Using {port}")
-    cli = Stm32Cli(port, args.baud, args.dry_run)
+    cli = Esp32Cli(port, args.baud, args.dry_run)
 
     print("Running. Ctrl+C to quit.")
     last = time.monotonic()

@@ -86,28 +86,40 @@ def fail(msg: str) -> None:
 def tilt_sincos_gamma(deg: float) -> tuple[float, float]:
     if deg <= 0.0:
         return 0.0, 1.0
-    if deg >= 90.0:
+    if deg == 90.0:
         return 1.0, 0.0
+    if deg >= 180.0:
+        return 0.0, -1.0
     r = math.radians(deg)
     return math.sin(r), math.cos(r)
 
 
+def tilt_weights(sg: float, cg: float) -> tuple[float, float, float, float]:
+    """Match field_tilt_weights(): (a13, a24, w13, w24)."""
+    cos2g = cg * cg - sg * sg
+    wv = 1.0 / (4.0 * CV)
+    dw = cos2g * CV / (4.0 * CH * CH)
+    return cg / (2.0 * CH), sg / (2.0 * CH), wv - dw, wv + dw
+
+
 def tilt_synthesize(H: float, V: float, sg: float, cg: float) -> tuple[float, float, float, float]:
-    return (
-        -H * cg * INV_H + V * INV_V,
-        H * sg * INV_H + V * INV_V,
-        -H * cg * INV_H - V * INV_V,
-        H * sg * INV_H - V * INV_V,
-    )
+    """Match field_tilt_synthesize(): one linear law per coil (pure sines)."""
+    a13, a24, w13, w24 = tilt_weights(sg, cg)
+    return (-a13 * H + w13 * V, a24 * H + w24 * V, -a13 * H - w13 * V, a24 * H - w24 * V)
 
 
 def tilt_shared_scale(ah: float, av: float, sg: float, cg: float, umax: float = 255.0) -> float:
-    p13 = math.hypot(ah * cg * INV_H, av * INV_V)
-    p24 = math.hypot(ah * sg * INV_H, av * INV_V)
-    pmax = max(p13, p24)
-    if pmax <= umax:
+    a13, a24, w13, w24 = tilt_weights(sg, cg)
+    pmax = max(math.hypot(a13 * ah, w13 * av), math.hypot(a24 * ah, w24 * av))
+    if umax <= 0.0 or pmax <= umax:
         return 1.0
     return umax / pmax
+
+
+def tilt_max_gain(sg: float, cg: float) -> float:
+    """R_max / umax for a circle (H = V): 6 / sqrt(15 + cos^2 2γ)."""
+    a13, a24, w13, w24 = tilt_weights(sg, cg)
+    return 1.0 / math.sqrt(max(a13 * a13 + w13 * w13, a24 * a24 + w24 * w24))
 
 
 def tilt_commands_exact(ah: float, av: float, sin_th: float, cos_th: float,
@@ -119,14 +131,15 @@ def tilt_commands_exact(ah: float, av: float, sin_th: float, cos_th: float,
 
 def tilt_commands_lut(phase: int, amp_h: int, amp_v: int, ccw: bool,
                       sg: float, cg: float) -> tuple[tuple[int, int, int, int], float]:
-    """Match firmware revolve_tilt_currents() (LUT sin/cos, shared scale, signed round)."""
+    """Match firmware revolve_tilt_currents() (LUT sin/cos, max gain, shared scale, signed round)."""
     ph = phase & 0xFFFFFFFF
     if ccw:
         ph = (-ph) & 0xFFFFFFFF
     si = lut_from_phase(ph)
     s = lut_unit(si)
     c = lut_unit(si + LUT_90)
-    raw, scale = tilt_commands_exact(float(amp_h), float(amp_v), s, c, sg, cg, 255.0)
+    g = tilt_max_gain(sg, cg)
+    raw, scale = tilt_commands_exact(float(amp_h) * g, float(amp_v) * g, s, c, sg, cg, 255.0)
     return (clamp_pwm(raw[0]), clamp_pwm(raw[1]), clamp_pwm(raw[2]), clamp_pwm(raw[3])), scale
 
 
@@ -171,11 +184,17 @@ def check_tilt_mode() -> None:
     if abs(bx + 100.0) > tol or abs(by) > tol or abs(bz) > tol:
         fail(f"python gamma=90 theta=0 field {bx},{by},{bz}")
 
-    for deg in (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0):
+    for deg in (0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 120.0, 150.0, 180.0):
         sg, cg = tilt_sincos_gamma(deg)
         raw, _ = tilt_commands_exact(A, A, 1.0, 0.0, sg, cg)
-        if any(abs(a - b) > 1e-4 for a, b in zip(raw, (50.0, 50.0, -50.0, -50.0))):
-            fail(f"python theta=90 commands at gamma={deg}: {raw}")
+        # Pure vertical: w13 = 1/2 - cos2γ/6 on M1/M3, w24 = 1/2 + cos2γ/6 on M2/M4.
+        c2 = math.cos(2.0 * math.radians(deg))
+        w13 = 0.5 - c2 / 6.0
+        w24 = 0.5 + c2 / 6.0
+        want = (A * w13, A * w24, -A * w13, -A * w24)
+        if any(abs(a - b) > 1e-4 for a, b in zip(raw, want)):
+            fail(f"python theta=90 commands at gamma={deg}: {raw} want {want}")
+        want_b = 100.0 * tilt_max_gain(sg, cg)
         for si in range(0, N, 5):
             ph = (si << 32) // N
             cmd, _ = tilt_commands_lut(ph, 100, 100, False, sg, cg)
@@ -183,8 +202,8 @@ def check_tilt_mode() -> None:
             bn = bx * cg + bz * sg
             if abs(bn) > 2.0:
                 fail(f"LUT Bn={bn} at gamma={deg} si={si}")
-            if abs(babs - 100.0) > 3.0:
-                fail(f"LUT |B|={babs} at gamma={deg} si={si}")
+            if abs(babs - want_b) > 3.0:
+                fail(f"LUT |B|={babs} at gamma={deg} si={si} want {want_b}")
             cmd_ccw, _ = tilt_commands_lut(ph, 100, 100, True, sg, cg)
             bx2, by2, bz2, babs2 = lab_b_from_coils(*cmd_ccw)
             if abs(bx2 * cg + bz2 * sg) > 2.0:
@@ -216,6 +235,71 @@ def check_tilt_mode() -> None:
     if revolve_z(0, 100)[0] != 0 or revolve_z(0, 100)[2] != 0:
         fail("revolve z Q0 should leave M1/M3 at 0 (pure H on XY pair)")
 
+    check_max_circle()
+
+
+def check_max_circle() -> None:
+    """amp 255 is the largest constant-|B| circle with pure-sine coils."""
+    for deg in (0.0, 15.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 180.0):
+        sg, cg = tilt_sincos_gamma(deg)
+        g = tilt_max_gain(sg, cg)
+        closed = 6.0 / math.sqrt(15.0 + math.cos(2.0 * math.radians(deg)) ** 2)
+        if abs(g - closed) > 1e-9:
+            fail(f"gain at gamma={deg}: {g} vs closed form {closed}")
+        want = 255.0 * g
+        peaks = [0.0, 0.0, 0.0, 0.0]
+        mags = []
+        for i in range(720):
+            th = 2.0 * math.pi * i / 720.0
+            raw, sc = tilt_commands_exact(want, want, math.sin(th), math.cos(th), sg, cg)
+            if abs(sc - 1.0) > 1e-6:
+                fail(f"max circle at gamma={deg} should not need shared scale ({sc})")
+            peaks = [max(p, abs(v)) for p, v in zip(peaks, raw)]
+            bx, by, bz, babs = lab_b_from_coils(*raw)
+            if abs(bx * cg + bz * sg) > 1e-6:
+                fail(f"max circle left the plane at gamma={deg}")
+            mags.append(babs)
+        # All four coils reach ±255 together (no coil idles, none clips).
+        if any(abs(p - 255.0) > 0.05 for p in peaks):
+            fail(f"max circle at gamma={deg}: coil peaks {peaks} want all 255")
+        if max(mags) - min(mags) > 1e-3 or abs(mags[0] - want) > 1e-3:
+            fail(f"max circle |B| not constant at gamma={deg}: {min(mags)}..{max(mags)}")
+        if tilt_shared_scale(want * 1.01, want * 1.01, sg, cg) >= 1.0:
+            fail(f"gamma={deg}: circle above R_max was accepted")
+
+    # Revolve X roles: M1/M3 = H + 1/3 V, M2/M4 = 2/3 V and no H.
+    for si in range(0, N, 3):
+        ph = (si << 32) // N
+        th = 2.0 * math.pi * lut_from_phase(ph) / N
+        m1, m2, m3, m4 = tilt_commands_lut(ph, 200, 200, False, 0.0, 1.0)[0]
+        R = 200 * 1.5
+        want = (-R / math.sqrt(3.0) * math.cos(th) + R / 3.0 * math.sin(th),
+                2.0 * R / 3.0 * math.sin(th),
+                -R / math.sqrt(3.0) * math.cos(th) - R / 3.0 * math.sin(th),
+                -2.0 * R / 3.0 * math.sin(th))
+        if any(abs(a - b) > 1.01 for a, b in zip((m1, m2, m3, m4), want)):
+            fail(f"revolve x roles at si={si}: {(m1, m2, m3, m4)} want {want}")
+        if abs(m2 + m4) > 1:
+            fail(f"revolve x: M2/M4 must cancel horizontally at si={si} ({m2},{m4})")
+        m1, m2, m3, m4 = revolve_z(ph, 200)
+        if abs(m1 + m3) > 1:
+            fail(f"revolve z: M1/M3 must cancel horizontally at si={si} ({m1},{m3})")
+
+    # Revolve X at amp 255: every coil peaks at 255, |B| ≈ 1.5·255 throughout.
+    mags = []
+    peaks = [0, 0, 0, 0]
+    for si in range(N):
+        ph = (si << 32) // N
+        cmd = revolve_x(ph, 255)
+        peaks = [max(p, abs(v)) for p, v in zip(peaks, cmd)]
+        mags.append(lab_b_from_coils(*cmd)[3])
+    want = 255.0 * 1.5
+    if any(p < 254 or p > 255 for p in peaks):
+        fail(f"revolve x amp 255 coil peaks {peaks}, want all ~255")
+    if max(abs(m - want) for m in mags) > 3.0:
+        fail(f"revolve x amp 255 |B| {min(mags)}..{max(mags)} want ~{want}")
+    print(f"ok: revolve X/Z max circle |B|={want:.1f}, all four coils pure sines at 255")
+
 
 def envelope_amp(live: int, peak: int) -> int:
     """Match firmware revolve_envelope_amp()."""
@@ -235,18 +319,19 @@ def envelope_amp(live: int, peak: int) -> int:
 def check_firmware_constants() -> None:
     """The Python model must use the firmware's LUT and coil tilt, not a copy."""
     root = Path(__file__).resolve().parent.parent
-    main_c = (root / "src" / "main.c").read_text(encoding="utf-8")
+    engine_c = (root / "src" / "field_engine.c").read_text(encoding="utf-8")
+    cfg = (root / "include" / "config.h").read_text(encoding="utf-8")
     hdr = (root / "include" / "field_tilt.h").read_text(encoding="utf-8")
 
-    m = re.search(r"#define\s+SINE_LUT_SIZE\s+(\d+)", main_c)
+    m = re.search(r"#define\s+SINE_LUT_SIZE\s+(\d+)", cfg)
     if not m or int(m.group(1)) != N:
-        fail(f"SINE_LUT_SIZE in main.c != {N}")
-    m = re.search(r"#define\s+SINE_LUT_90\s+(\d+)u?", main_c)
+        fail(f"SINE_LUT_SIZE in config.h != {N}")
+    m = re.search(r"#define\s+SINE_LUT_90\s+(\d+)u?", cfg)
     if not m or int(m.group(1)) != LUT_90:
-        fail(f"SINE_LUT_90 in main.c != {LUT_90}")
-    m = re.search(r"SINE_LUT\[SINE_LUT_SIZE\]\s*=\s*\{([^}]*)\}", main_c)
+        fail(f"SINE_LUT_90 in config.h != {LUT_90}")
+    m = re.search(r"SINE_LUT\[SINE_LUT_SIZE\]\s*=\s*\{([^}]*)\}", engine_c)
     if not m:
-        fail("SINE_LUT table not found in main.c")
+        fail("SINE_LUT table not found in field_engine.c")
     fw = [int(v) for v in m.group(1).replace("\n", " ").split(",") if v.strip()]
     if len(fw) != N:
         fail(f"SINE_LUT has {len(fw)} entries, want {N}")
@@ -310,13 +395,14 @@ def main() -> int:
     z_signs = []
     x_signs = []
     q0_bh = q1_bv = None
+    rev_b = amp * 1.5  # |B| = amp * max gain (1.5 for X/Z)
     for ph, name in corners:
         zcmd = revolve_z(ph, amp, False)
         bx, by, bz, babs = lab_b_from_coils(*zcmd)
         if abs(bz) > 1.0:
             fail(f"revolve z Bz should be 0 at {name}: {bz}")
-        if abs(babs - amp) > 3.0:
-            fail(f"revolve z |B| at {name}: {babs} want ~{amp}")
+        if abs(babs - rev_b) > 3.0:
+            fail(f"revolve z |B| at {name}: {babs} want ~{rev_b}")
         hs = 1 if bx > 2 else (-1 if bx < -2 else 0)
         vs = 1 if by > 2 else (-1 if by < -2 else 0)
         z_signs.append((hs, vs))
@@ -329,8 +415,8 @@ def main() -> int:
         xx, xy, xz, xabs = lab_b_from_coils(*xcmd)
         if abs(xx) > 1.0:
             fail(f"revolve x Bx should be 0 at {name}: {xx}")
-        if abs(xabs - amp) > 3.0:
-            fail(f"revolve x |B| at {name}: {xabs}")
+        if abs(xabs - rev_b) > 3.0:
+            fail(f"revolve x |B| at {name}: {xabs} want ~{rev_b}")
         hs = 1 if xz > 2 else (-1 if xz < -2 else 0)
         vs = 1 if xy > 2 else (-1 if xy < -2 else 0)
         x_signs.append((hs, vs))
@@ -353,8 +439,8 @@ def main() -> int:
     if max(rev_babs) - min(rev_babs) > 4.0:
         fail(f"revolve |B| not nearly constant: span {max(rev_babs) - min(rev_babs)}")
     mean_b = sum(rev_babs) / len(rev_babs)
-    if abs(mean_b - amp) > 3.0:
-        fail(f"revolve |B| mean {mean_b} want ~{amp}")
+    if abs(mean_b - rev_b) > 3.0:
+        fail(f"revolve |B| mean {mean_b} want ~{rev_b}")
 
     # CCW from Q0 (γ=90, −X) should stay in XY.
     z0 = revolve_z(0, amp, True)
@@ -377,19 +463,20 @@ def main() -> int:
     if abs(mid - want) > 2:
         fail(f"envelope mid {mid} want ~{want}")
 
-    # Ah=amp/4, Av=amp: Q0 |Bh|≈Ah, Q1 |Bv|≈Av
+    # Ah=amp/4, Av=amp: Q0 |Bh|≈Ah·g, Q1 |Bv|≈Av·g
     ah, av = amp // 4, amp
+    g = 1.5
     z0 = revolve_z(0, ah, False, av)
     bx, by, _, _ = lab_b_from_coils(*z0)
-    if abs(by) > 2.0 or abs(abs(bx) - ah) > 3.0:
-        fail(f"ellipse Q0 Bx,By={bx},{by} want |Bx|~{ah}, By~0")
+    if abs(by) > 2.0 or abs(abs(bx) - ah * g) > 3.0:
+        fail(f"ellipse Q0 Bx,By={bx},{by} want |Bx|~{ah * g}, By~0")
     z1 = revolve_z(0x40000000, ah, False, av)
     bx, by, _, _ = lab_b_from_coils(*z1)
-    if abs(bx) > 2.0 or abs(abs(by) - av) > 3.0:
-        fail(f"ellipse Q1 Bx,By={bx},{by} want Bx~0, |By|~{av}")
+    if abs(bx) > 2.0 or abs(abs(by) - av * g) > 3.0:
+        fail(f"ellipse Q1 Bx,By={bx},{by} want Bx~0, |By|~{av * g}")
 
     print("ok: rotate Y pairing + lab B (30 deg, |B|~amp*sqrt(3))")
-    print("ok: 4-coil revolve X/Z constant |B|, Q0|Bh|=Q1|Bv|, ellipse")
+    print("ok: 4-coil revolve X/Z constant |B|~amp*1.5, Q0|Bh|=Q1|Bv|, ellipse")
 
     check_tilt_mode()
     print("ok: tilted-axis revolve LUT path + reference vectors + Bn=0")
@@ -411,6 +498,27 @@ def main() -> int:
     if abs(rx - bx) > 1e-4 or abs(ry - by) > 1e-4 or abs(rz - bz) > 1e-4:
         fail(f"reconstruct {rx},{ry},{rz} vs {bx},{by},{bz}")
     print("ok: centre reconstruction from coil-axis projections")
+
+    # Behind-coil chip frame (field_tilt_sensor_basis): z = zsign*axis,
+    # x = +Y minus its axial part (/c_h), y = z x x. Lab-rotated chip readings
+    # must give back u_i on the axis even with transverse junk on x/y.
+    zs = (1, -1, -1, 1)
+    uhat = []
+    for i, ax in enumerate(axes):
+        ez = tuple(zs[i] * a for a in ax)
+        ex = (-ax[1] * ax[0] / CH, (1.0 - ax[1] * ax[1]) / CH, -ax[1] * ax[2] / CH)
+        ey = (ez[1] * ex[2] - ez[2] * ex[1],
+              ez[2] * ex[0] - ez[0] * ex[2],
+              ez[0] * ex[1] - ez[1] * ex[0])
+        if abs(ex[1] - CH) > 1e-9:
+            fail(f"M{i + 1} chip x not tilted-up: {ex}")
+        bs = (1.5 * (i + 1), -0.7 * i, zs[i] * raw[i])
+        lab = tuple(ex[a] * bs[0] + ey[a] * bs[1] + ez[a] * bs[2] for a in range(3))
+        uhat.append(lab[0] * ax[0] + lab[1] * ax[1] + lab[2] * ax[2])
+    rx, ry, rz, _ = lab_b_from_coils(*uhat)
+    if abs(rx - bx) > 1e-4 or abs(ry - by) > 1e-4 or abs(rz - bz) > 1e-4:
+        fail(f"chip-frame reconstruct {rx},{ry},{rz} vs {bx},{by},{bz}")
+    print("ok: centre reconstruction from behind-coil chip frames")
     return 0
 
 

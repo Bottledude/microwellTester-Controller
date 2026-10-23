@@ -10,3 +10,7 @@ python3 monitor/test_dualsense_queue.py
 gcc -O2 -std=c11 -Wall -Wextra -Iinclude -o /tmp/test_field_tilt \
   monitor/test_field_tilt.c src/field_tilt.c -lm
 /tmp/test_field_tilt
+
+gcc -O2 -std=c11 -Wall -Wextra -Iinclude -o /tmp/test_field_fb \
+  monitor/test_field_fb.c src/field_fb.c src/field_tilt.c -lm
+/tmp/test_field_fb

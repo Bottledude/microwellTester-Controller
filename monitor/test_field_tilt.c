@@ -79,14 +79,19 @@ static void check_reference_vectors(void)
          "gamma=90 theta=0 field");
 
   {
-    const float gs[] = {0.0f, 15.0f, 30.0f, 45.0f, 60.0f, 75.0f, 90.0f};
+    const float gs[] = {0.0f, 15.0f, 30.0f, 45.0f, 60.0f, 75.0f, 90.0f,
+                        120.0f, 150.0f, 180.0f};
     int i;
-    for (i = 0; i < 7; i++) {
+    for (i = 0; i < 10; i++) {
+      float c2 = cosf(2.0f * gs[i] * (3.14159265358979323846f / 180.0f));
+      float w13 = 0.5f - c2 / 6.0f;
+      float w24 = 0.5f + c2 / 6.0f;
       gamma_of(gs[i], &sg, &cg);
       field_tilt_commands(A, A, 1.0f, 0.0f, sg, cg, 255.0f, raw, NULL);
-      expect(nearly(raw[0], 50.0f, tol) && nearly(raw[1], 50.0f, tol) &&
-                 nearly(raw[2], -50.0f, tol) && nearly(raw[3], -50.0f, tol),
-             "any gamma theta=90 commands");
+      /* Pure vertical: w13 = 1/2 − cos2γ/6 on M1/M3, w24 = 1/2 + cos2γ/6 on M2/M4. */
+      expect(nearly(raw[0], A * w13, tol) && nearly(raw[1], A * w24, tol) &&
+                 nearly(raw[2], -A * w13, tol) && nearly(raw[3], -A * w24, tol),
+             "theta=90 vertical split w13/w24");
       field_tilt_forward(raw, &bx, &by, &bz);
       expect(nearly(bx, 0.0f, tol) && nearly(by, 100.0f, tol) &&
                  nearly(bz, 0.0f, tol),
@@ -97,12 +102,13 @@ static void check_reference_vectors(void)
 
 static void sweep_math(void)
 {
-  const float gs[] = {0.0f, 15.0f, 30.0f, 45.0f, 60.0f, 75.0f, 90.0f};
+  const float gs[] = {0.0f, 15.0f, 30.0f, 45.0f, 60.0f, 75.0f, 90.0f,
+                      120.0f, 150.0f, 180.0f};
   const float A = 100.0f;
   const float tol = 2e-4f;
   int gi, si;
 
-  for (gi = 0; gi < 7; gi++) {
+  for (gi = 0; gi < 10; gi++) {
     float sg, cg;
     gamma_of(gs[gi], &sg, &cg);
     for (si = 0; si < 360; si++) {
@@ -270,6 +276,63 @@ static void check_no_independent_clip_direction(void)
          "shared scale preserves field direction");
 }
 
+static void check_max_circle(void)
+{
+  const float gs[] = {0.0f, 20.0f, 45.0f, 70.0f, 90.0f, 135.0f, 180.0f};
+  int gi, si, k;
+
+  for (gi = 0; gi < 7; gi++) {
+    float sg, cg, R, mn = 1e9f, mx = 0.0f, scale, c2;
+    float peak[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    gamma_of(gs[gi], &sg, &cg);
+    c2 = cosf(2.0f * gs[gi] * (3.14159265358979323846f / 180.0f));
+    expect(nearly(field_tilt_max_gain(sg, cg), 6.0f / sqrtf(15.0f + c2 * c2), 1e-5f),
+           "max gain = 6 / sqrt(15 + cos²2γ)");
+    R = 255.0f * field_tilt_max_gain(sg, cg);
+    for (si = 0; si < 720; si++) {
+      float th = (float)si * (3.14159265358979323846f / 360.0f);
+      float raw[4], bx, by, bz, m;
+      field_tilt_commands(R, R, sinf(th), cosf(th), sg, cg, 255.0f, raw, &scale);
+      if (!nearly(scale, 1.0f, 1e-4f)) {
+        fail("max circle should not need shared scale");
+        return;
+      }
+      for (k = 0; k < 4; k++) if (fabsf(raw[k]) > peak[k]) peak[k] = fabsf(raw[k]);
+      field_tilt_forward(raw, &bx, &by, &bz);
+      m = sqrtf(bx * bx + by * by + bz * bz);
+      if (m < mn) mn = m;
+      if (m > mx) mx = m;
+    }
+    for (k = 0; k < 4; k++) {
+      expect(nearly(peak[k], 255.0f, 0.05f), "max circle: every coil peaks at 255");
+    }
+    expect(nearly(mn, R, 0.05f) && nearly(mx, R, 0.05f), "max circle |B| constant");
+    expect(field_tilt_shared_scale(R * 1.01f, R * 1.01f, sg, cg, 255.0f) < 1.0f,
+           "circle above R_max must be scaled");
+  }
+  expect(nearly(field_tilt_max_gain(0.0f, 1.0f), 1.5f, 1e-5f), "revolve X gain 1.5");
+  expect(nearly(field_tilt_max_gain(1.0f, 0.0f), 1.5f, 1e-5f), "revolve Z gain 1.5");
+
+  /* Revolve X roles: M1/M3 = H + V/3, M2/M4 = 2V/3, no H on M2/M4. */
+  {
+    float sg, cg, raw[4];
+    const float R = 300.0f;
+    gamma_of(0.0f, &sg, &cg);
+    for (si = 0; si < 360; si += 7) {
+      float th = (float)si * (3.14159265358979323846f / 180.0f);
+      float H = R * cosf(th), V = R * sinf(th);
+      field_tilt_commands(R, R, sinf(th), cosf(th), sg, cg, 255.0f, raw, NULL);
+      if (!nearly(raw[0], -H / 1.7320508f + V / 3.0f, 1e-2f) ||
+          !nearly(raw[1], 2.0f * V / 3.0f, 1e-2f) ||
+          !nearly(raw[2], -H / 1.7320508f - V / 3.0f, 1e-2f) ||
+          !nearly(raw[3], -2.0f * V / 3.0f, 1e-2f)) {
+        fail("revolve X: M1/M3 = H + V/3, M2/M4 = 2V/3");
+        return;
+      }
+    }
+  }
+}
+
 static void check_parse(void)
 {
   float v = 123.0f;
@@ -277,8 +340,10 @@ static void check_parse(void)
   expect(field_tilt_parse_gamma("90", &v) && v == 90.0f, "parse 90");
   expect(field_tilt_parse_gamma("45.0", &v) && nearly(v, 45.0f, 1e-5f), "parse 45.0");
   expect(field_tilt_parse_gamma("15.5", &v) && nearly(v, 15.5f, 1e-5f), "parse 15.5");
+  expect(field_tilt_parse_gamma("135", &v) && v == 135.0f, "parse 135");
+  expect(field_tilt_parse_gamma("180", &v) && v == 180.0f, "parse 180");
   v = 7.0f;
-  expect(!field_tilt_parse_gamma("91", &v) && v == 7.0f, "reject 91, no write");
+  expect(!field_tilt_parse_gamma("181", &v) && v == 7.0f, "reject 181, no write");
   expect(!field_tilt_parse_gamma("-1", &v) && v == 7.0f, "reject -1, no write");
   expect(!field_tilt_parse_gamma("45x", &v) && v == 7.0f, "reject 45x");
   expect(!field_tilt_parse_gamma("360", &v) && v == 7.0f, "reject wrap 360");
@@ -389,6 +454,75 @@ static void check_reconstruct(void)
          "reconstruct from coil-axis projections matches forward");
 }
 
+static float dot3(const float a[3], const float b[3])
+{
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void check_sensor_frame(void)
+{
+  float sg, cg, raw[4], bx, by, bz, rx, ry, rz;
+  float b_s[4][3];
+  const int8_t zs[4] = {1, -1, -1, 1};
+  const float k[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  const uint8_t present[4] = {1, 1, 1, 1};
+  int i, s;
+
+  /* Right-handed orthonormal, z = ±â, x leans toward lab +Y. */
+  for (i = 0; i < 4; i++) {
+    for (s = -1; s <= 1; s += 2) {
+      float ex[3], ey[3], ez[3], ax[3], c[3];
+      field_tilt_sensor_basis((uint8_t)i, (int8_t)s, ex, ey, ez);
+      field_tilt_coil_axis((uint8_t)i, ax);
+      c[0] = ex[1] * ey[2] - ex[2] * ey[1];
+      c[1] = ex[2] * ey[0] - ex[0] * ey[2];
+      c[2] = ex[0] * ey[1] - ex[1] * ey[0];
+      expect(nearly(dot3(ex, ex), 1.0f, 1e-5f) && nearly(dot3(ey, ey), 1.0f, 1e-5f) &&
+                 nearly(dot3(ez, ez), 1.0f, 1e-5f) && nearly(dot3(ex, ey), 0.0f, 1e-5f) &&
+                 nearly(dot3(ex, ez), 0.0f, 1e-5f) && nearly(dot3(ey, ez), 0.0f, 1e-5f),
+             "sensor basis orthonormal");
+      expect(nearly(c[0], ez[0], 1e-5f) && nearly(c[1], ez[1], 1e-5f) &&
+                 nearly(c[2], ez[2], 1e-5f),
+             "sensor basis right-handed (x × y = z)");
+      expect(nearly(dot3(ez, ax), (float)s, 1e-5f), "sensor z = z_sign · coil axis");
+      expect(nearly(ex[1], FIELD_CH, 1e-5f), "sensor x is up, tilted 30°");
+    }
+  }
+
+  /* Each chip reads its coil's centre field on +z (times z_sign) plus
+   * transverse junk; the centre must match the forward map regardless. */
+  gamma_of(60.0f, &sg, &cg);
+  field_tilt_commands(90.0f, 70.0f, -0.28f, 0.96f, sg, cg, 255.0f, raw, NULL);
+  field_tilt_forward(raw, &bx, &by, &bz);
+  for (i = 0; i < 4; i++) {
+    b_s[i][0] = 3.0f * (float)(i + 1);
+    b_s[i][1] = -2.0f * (float)i;
+    b_s[i][2] = (float)zs[i] * raw[i];
+  }
+  field_tilt_center_from_sensors(b_s, zs, k, present, &rx, &ry, &rz);
+  expect(nearly(rx, bx, 1e-3f) && nearly(ry, by, 1e-3f) && nearly(rz, bz, 1e-3f),
+         "centre from chip frames matches forward (transverse ignored)");
+
+  /* Lab rotation round-trips the axial reading onto â_i. */
+  {
+    float lab[3], ax[3];
+    field_tilt_sensor_to_lab(2, -1, b_s[2], lab);
+    field_tilt_coil_axis(2, ax);
+    expect(nearly(dot3(lab, ax), raw[2], 1e-3f), "sensor_to_lab axial projection");
+  }
+
+  /* Missing chip contributes nothing. */
+  {
+    uint8_t p[4] = {1, 0, 1, 1};
+    float u[4];
+    u[0] = raw[0]; u[1] = 0.0f; u[2] = raw[2]; u[3] = raw[3];
+    field_tilt_forward(u, &bx, &by, &bz);
+    field_tilt_center_from_sensors(b_s, zs, k, p, &rx, &ry, &rz);
+    expect(nearly(rx, bx, 1e-3f) && nearly(ry, by, 1e-3f) && nearly(rz, bz, 1e-3f),
+           "centre from chip frames with M2 missing");
+  }
+}
+
 int main(void)
 {
   check_parse();
@@ -404,6 +538,8 @@ int main(void)
   check_coherent_coeffs();
   check_quantized_field_bound();
   check_reconstruct();
+  check_sensor_frame();
+  check_max_circle();
 
   if (g_fails) {
     fprintf(stderr, "%d check(s) failed\n", g_fails);

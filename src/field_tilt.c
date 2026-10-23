@@ -30,9 +30,12 @@ void field_tilt_gamma_sincos(float gamma_deg, float *sin_g, float *cos_g)
   if (gamma_deg <= FIELD_TILT_GAMMA_MIN) {
     sg = 0.0f;
     cg = 1.0f;
-  } else if (gamma_deg >= FIELD_TILT_GAMMA_MAX) {
+  } else if (gamma_deg == 90.0f) {
     sg = 1.0f;
     cg = 0.0f;
+  } else if (gamma_deg >= FIELD_TILT_GAMMA_MAX) {
+    sg = 0.0f;
+    cg = -1.0f;
   } else {
     r = gamma_deg * (3.14159265358979323846f / 180.0f);
     sg = sinf(r);
@@ -52,16 +55,42 @@ void field_tilt_coeffs_from_deg(float gamma_deg, FieldTiltCoeffs *out)
   *out = tmp;
 }
 
+void field_tilt_weights(float sin_g, float cos_g, FieldTiltWeights *w)
+{
+  float cos2g, wv, dw;
+
+  if (!w) return;
+  cos2g = cos_g * cos_g - sin_g * sin_g;
+  wv = 1.0f / (4.0f * FIELD_CV);                           /* even V share */
+  dw = cos2g * FIELD_CV / (4.0f * FIELD_CH * FIELD_CH);    /* peak balance */
+  w->a13 = cos_g / (2.0f * FIELD_CH);
+  w->a24 = sin_g / (2.0f * FIELD_CH);
+  w->w13 = wv - dw;
+  w->w24 = wv + dw;
+}
+
+float field_tilt_max_gain(float sin_g, float cos_g)
+{
+  FieldTiltWeights w;
+  float p13, p24;
+
+  field_tilt_weights(sin_g, cos_g, &w);
+  p13 = w.a13 * w.a13 + w.w13 * w.w13;
+  p24 = w.a24 * w.a24 + w.w24 * w.w24;
+  return 1.0f / sqrtf((p13 > p24) ? p13 : p24);
+}
+
 float field_tilt_shared_scale(float ah, float av, float sin_g, float cos_g,
                               float umax)
 {
-  float inv_h = 1.0f / (2.0f * FIELD_CH);
-  float inv_v = 1.0f / (4.0f * FIELD_CV);
-  float p13 = sqrtf((ah * cos_g * inv_h) * (ah * cos_g * inv_h) +
-                    (av * inv_v) * (av * inv_v));
-  float p24 = sqrtf((ah * sin_g * inv_h) * (ah * sin_g * inv_h) +
-                    (av * inv_v) * (av * inv_v));
-  float pmax = (p13 > p24) ? p13 : p24;
+  FieldTiltWeights w;
+  float p13, p24, pmax;
+
+  field_tilt_weights(sin_g, cos_g, &w);
+  /* u = a·Ah cosθ ± w·Av sinθ peaks at sqrt((a·Ah)² + (w·Av)²). */
+  p13 = sqrtf((w.a13 * ah) * (w.a13 * ah) + (w.w13 * av) * (w.w13 * av));
+  p24 = sqrtf((w.a24 * ah) * (w.a24 * ah) + (w.w24 * av) * (w.w24 * av));
+  pmax = (p13 > p24) ? p13 : p24;
 
   if (!(umax > 0.0f) || !(pmax > umax)) return 1.0f;
   return umax / pmax;
@@ -70,16 +99,14 @@ float field_tilt_shared_scale(float ah, float av, float sin_g, float cos_g,
 void field_tilt_synthesize(float H, float V, float sin_g, float cos_g,
                            float raw[4])
 {
-  float inv_h;
-  float inv_v;
+  FieldTiltWeights w;
 
   if (!raw) return;
-  inv_h = 1.0f / (2.0f * FIELD_CH);
-  inv_v = 1.0f / (4.0f * FIELD_CV);
-  raw[0] = -H * cos_g * inv_h + V * inv_v; /* M1 */
-  raw[1] =  H * sin_g * inv_h + V * inv_v; /* M2 */
-  raw[2] = -H * cos_g * inv_h - V * inv_v; /* M3 */
-  raw[3] =  H * sin_g * inv_h - V * inv_v; /* M4 */
+  field_tilt_weights(sin_g, cos_g, &w);
+  raw[0] = -w.a13 * H + w.w13 * V; /* M1 */
+  raw[1] =  w.a24 * H + w.w24 * V; /* M2 */
+  raw[2] = -w.a13 * H - w.w13 * V; /* M3 */
+  raw[3] =  w.a24 * H - w.w24 * V; /* M4 */
 }
 
 void field_tilt_quantize(const float raw[4], int16_t cmd[4], int16_t umax)
@@ -165,6 +192,58 @@ void field_tilt_reconstruct_center(const float b_lab[4][3], const float k[4],
     }
   }
   field_tilt_forward(u, bx, by, bz);
+}
+
+void field_tilt_sensor_basis(uint8_t coil, int8_t z_sign,
+                             float ex[3], float ey[3], float ez[3])
+{
+  float a[3], s, inv_n;
+  int i;
+
+  if (!ex || !ey || !ez) return;
+  field_tilt_coil_axis(coil, a);
+  s = (z_sign < 0) ? -1.0f : 1.0f;
+  for (i = 0; i < 3; i++) ez[i] = s * a[i];
+  /* x = +Y minus its axial part; |…| = sqrt(1 − a_y²) = c_h for every coil. */
+  inv_n = 1.0f / FIELD_CH;
+  ex[0] = -a[1] * a[0] * inv_n;
+  ex[1] = (1.0f - a[1] * a[1]) * inv_n;
+  ex[2] = -a[1] * a[2] * inv_n;
+  /* y = z × x keeps (x, y, z) right-handed. */
+  ey[0] = ez[1] * ex[2] - ez[2] * ex[1];
+  ey[1] = ez[2] * ex[0] - ez[0] * ex[2];
+  ey[2] = ez[0] * ex[1] - ez[1] * ex[0];
+}
+
+void field_tilt_sensor_to_lab(uint8_t coil, int8_t z_sign,
+                              const float b_s[3], float b_lab[3])
+{
+  float ex[3], ey[3], ez[3];
+  int i;
+
+  if (!b_s || !b_lab) return;
+  field_tilt_sensor_basis(coil, z_sign, ex, ey, ez);
+  for (i = 0; i < 3; i++) {
+    b_lab[i] = ex[i] * b_s[0] + ey[i] * b_s[1] + ez[i] * b_s[2];
+  }
+}
+
+void field_tilt_center_from_sensors(const float b_s[4][3],
+                                    const int8_t z_sign[4], const float k[4],
+                                    const uint8_t present[4],
+                                    float *bx, float *by, float *bz)
+{
+  float b_lab[4][3];
+  int i;
+
+  for (i = 0; i < 4; i++) {
+    b_lab[i][0] = b_lab[i][1] = b_lab[i][2] = 0.0f;
+    if (!b_s || (present && !present[i])) continue;
+    field_tilt_sensor_to_lab((uint8_t)i, z_sign ? z_sign[i] : 1, b_s[i],
+                             b_lab[i]);
+  }
+  /* Projecting the lab vector on â_i picks out exactly z_sign_i·Bz_i. */
+  field_tilt_reconstruct_center(b_lab, k, present, bx, by, bz);
 }
 
 void field_tilt_commands(float ah, float av, float sin_th, float cos_th,

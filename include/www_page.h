@@ -222,7 +222,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 <div class="topbar">
   <div class="brand">
     <h1>SMC Field Controller</h1>
-    <div class="sub">STM32H743 · BTS7960 · lab instrument UI</div>
+    <div class="sub">ESP32-WROOM-32 · BTS7960 · lab instrument UI</div>
   </div>
   <div class="top-actions">
     <div class="pill"><span class="dot" id="linkDot"></span><span id="linkText">connecting…</span></div>
@@ -239,9 +239,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
   <span>H/V <b id="stHV">100/100</b></span>
   <span>γ <b id="stGamma">45</b>°</span>
   <span>dir <b id="stDir">cw</b></span>
-  <span>mode <b id="stMode">open</b></span>
-  <span>I<sub>1</sub> <b id="stIA">—</b></span>
-  <span>I<sub>2</sub> <b id="stIB">—</b></span>
+  <span>duty <b id="stDuty">—</b></span>
 </div>
 <div class="banner" id="msgBanner"></div>
 
@@ -272,7 +270,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       <div class="kv" style="margin-top:8px">
         Live firmware snapshot (from <code>json</code>): <b id="signedSnap">—</b><br/>
         MLX reconstructed centre (mT): <b id="mlxSnap">—</b><br/>
-        Live scope: USB Serial Monitor + Teleplot — type <code>teleplot on</code> on USART1.
+        Live scope: USB Serial Monitor + Teleplot — type <code>teleplot on</code> on UART0.
         PWM-proxy series <code>Bx/By/Babs</code>; measured <code>Bx_m/By_m/Babs_m</code>.
       </div>
     </div>
@@ -290,12 +288,12 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
           <div class="phase-box">
             <div class="t" id="phaseATitle">M1 ∥ M3 · cos ωt</div>
             <div class="v" id="phaseARole">Rotate Y · XZ</div>
-            <div class="kv" style="margin-top:6px">I ≈ <b id="phaseAI">0.000</b> A</div>
+            <div class="kv" style="margin-top:6px">duty ≈ <b id="phaseADuty">0</b></div>
           </div>
           <div class="phase-box">
             <div class="t" id="phaseBTitle">M2 ∥ M4 · sin ωt</div>
             <div class="v" id="phaseBRole">Rotate Y · XZ</div>
-            <div class="kv" style="margin-top:6px">I ≈ <b id="phaseBI">0.000</b> A</div>
+            <div class="kv" style="margin-top:6px">duty ≈ <b id="phaseBDuty">0</b></div>
           </div>
         </div>
       </div>
@@ -342,7 +340,7 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Revolve A scale (H / V)</h2>
-        <p class="section-help">A<sub>h</sub>=amp·H/100, A<sub>v</sub>=amp·V/100. 100/100 is a PWM-proxy circle (geometry no longer requires cutting H). Unequal radii are an ellipse. Rotate Y ignores this. Shared-scale if a coil would exceed 255.</p>
+        <p class="section-help">A<sub>h</sub>=amp·g·H/100, A<sub>v</sub>=amp·g·V/100, where g is the plane's max gain (1.5 for X/Z, ≈1.55 at γ=45). Revolve X: M1/M3 carry H plus 1/3 of V, M2/M4 carry 2/3 of V (Z is the reverse). Every coil is a pure sine, and at amp 255 (100/100) all four peak at 255 together: the largest constant-|B| circle. Unequal radii are an ellipse. Rotate Y ignores this. Shared-scale if a coil would exceed 255.</p>
         <div class="field">
           <label for="revHVal">Horizontal % <b id="revHLabel">100</b></label>
           <input id="revHVal" type="number" min="1" max="200" step="1" value="100"
@@ -365,21 +363,21 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
       <div class="card">
         <h2>Tilt axis γ</h2>
-        <p class="section-help">Fixed rotation axis in the XZ plane, measured from +X toward +Z (0–90°). 0° = revolve-X plane (YZ); 90° = revolve-Z plane (XY) with Q0 at −X. Changing γ while running ramps through 0. Does not rotate the axis over time.</p>
+        <p class="section-help">Fixed rotation axis in the XZ plane, measured from +X toward +Z (0–180°, covers every axis in the plane). 0° = revolve-X plane (YZ); 90° = revolve-Z plane (XY) with Q0 at −X; 180° = YZ again with the rotation reversed. All four coils drive pure sines at every γ. Changing γ while running ramps through 0. Does not rotate the axis over time.</p>
         <div class="field">
           <label for="gammaVal">γ (deg) <b id="gammaLabel">45</b></label>
-          <input id="gammaVal" type="number" min="0" max="90" step="1" value="45"
+          <input id="gammaVal" type="number" min="0" max="180" step="1" value="45"
             oninput="onGammaInput(+this.value)"
             onchange="applyGamma()"/>
         </div>
-        <input type="range" id="gammaRange" min="0" max="90" value="45"
+        <input type="range" id="gammaRange" min="0" max="180" value="45"
           oninput="onGammaInput(+this.value)"
           onchange="applyGamma()"/>
       </div>
 
       <div class="card">
         <h2>MLX90393 behind coils</h2>
-        <p class="section-help">Four chips on I2C2 (PB10/PB11, 3.3 V), one behind each coil. Centre B is reconstructed with the 30° mixing map. Display only — never drives PWM. Offset zeros Earth/bias with coils off.</p>
+        <p class="section-help">Four chips on I2C1 (GPIO18/19, 3.3 V), one behind each coil. Centre B is reconstructed with the 30° mixing map. Display only unless <b>Feedback</b> is on. Offset zeros Earth/bias with coils off.</p>
         <div class="kv">Present: <b id="mlxPresent">—</b><br/>
           Centre (mT): <b id="mlxB">—</b><br/>
           Coils: <b id="mlxCoils">—</b>
@@ -387,6 +385,19 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
         <div class="toolbar" style="margin-top:12px;margin-bottom:0;flex-wrap:wrap">
           <button type="button" onclick="sendCmd('mlx scan')">Scan</button>
           <button type="button" onclick="sendCmd('mlx offset')">Offset</button>
+        </div>
+        <h2 style="margin-top:16px">MLX feedback</h2>
+        <p class="section-help">On: each coil's sine is rescaled and phase-shifted from the chips so the measured centre B follows the commanded circle (needs all 4 chips, <code>mlx offset</code> and correct <code>zsign</code>). Learns once per revolution while the field is steady. Off: open-loop PWM, error still shown. Teleplot: <code>Bx_e</code>… (expected) vs <code>Bx_c</code>… (measured), <code>fb_err</code>.</p>
+        <div class="field" style="display:flex;align-items:center;gap:10px">
+          <label class="switch" title="MLX feedback">
+            <input type="checkbox" id="fbToggle" onchange="setFeedback(this.checked)">
+            <span class="slider"></span>
+          </label>
+          <span>Feedback <b id="fbState">off</b></span>
+          <button type="button" onclick="sendCmd('fb reset')">Reset</button>
+        </div>
+        <div class="kv">Circle error: <b id="fbErr">—</b><br/>
+          Correction |K| / phase: <b id="fbK">—</b>
         </div>
       </div>
 
@@ -413,26 +424,16 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
       </div>
 
       <div class="card">
-        <h2>Soft current limit</h2>
-        <p class="section-help">0–255 ≈ 0–2 A. Applied to all coils. While the AC field is on, over-limit reduces live amplitude.</p>
-        <div class="field">
-          <label for="limVal">Limit (0–255)</label>
-          <input id="limVal" type="number" min="0" max="255" value="255"/>
-        </div>
-        <button type="button" class="primary" onclick="applyLimit()">Apply limit (all)</button>
-      </div>
-
-      <div class="card">
         <h2>Link &amp; wiring</h2>
         <div class="kv">
           SoftAP: <b>CoilControl</b> / <b>coilcontrol</b><br/>
           UI: <b>http://192.168.4.1/</b><br/>
-          Serial CLI: USART1 @ 115200<br/>
-          ESP32 TX17 → PD9 · RX18 ← PD8<br/>
-          PCA I2C1 PB8 SCL / PB9 SDA (0x40) · OE to GND<br/>
-          MLX I2C2 PB10 SCL / PB11 SDA · VIN 3.3 V · CS high<br/>
+          Serial CLI: UART0 @ 115200<br/>
+          DualSense: Bluetooth Classic on this ESP32<br/>
+          PCA I2C0 GPIO21 SDA / GPIO22 SCL (0x40) · OE to GND<br/>
+          MLX I2C1 GPIO18 SDA / GPIO19 SCL · VIN 3.3 V · CS high<br/>
           PWM ch0/1 M1 · 2/3 M2 · 4/5 M3 · 6/7 M4<br/>
-          EN M1 PD10 · M2 PE4 · M3 PC4 · M4 PC5 · IS PA0–PA3
+          EN M1 GPIO25 · M2 GPIO26 · M3 GPIO27 · M4 GPIO14
         </div>
         <div class="toolbar" style="margin-top:12px;margin-bottom:0">
           <button type="button" onclick="poll()">Refresh status</button>
@@ -454,12 +455,8 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
     </div>
     <div class="cfg-grid" style="margin-bottom:14px">
       <div class="card">
-        <h2>DC control mode</h2>
-        <div class="seg">
-          <button type="button" id="modeOpenBtn" class="active" onclick="setMode('open')">Open-loop</button>
-          <button type="button" id="modeClosedBtn" onclick="setMode('closed')">Closed-loop</button>
-        </div>
-        <div class="kv" style="margin-top:10px">Active: <b id="cfgModeLabel">open</b> · contour <b id="cfgContourLabel">off</b></div>
+        <h2>DC drive</h2>
+        <div class="kv">Open-loop duty 0–255. Contour <b id="cfgContourLabel">off</b></div>
       </div>
     </div>
     <div class="grid" id="coils"></div>
@@ -467,14 +464,14 @@ static const char WWW_PAGE[] PROGMEM = R"HTML(
 
   <section id="tab-logs" class="tab-panel">
     <h2 class="section-title">Command log</h2>
-    <p class="section-help">Bridge traffic and raw STM32 CLI. Useful for lab debugging.</p>
+    <p class="section-help">Command traffic and raw CLI. Useful for lab debugging.</p>
     <div class="log-toolbar">
       <input id="rawCmd" type="text" placeholder="e.g. rotate on   or   revolve z 2 160   or   status"
         onkeydown="if(event.key==='Enter')sendRawCmd()"/>
       <button type="button" class="primary" onclick="sendRawCmd()">Send</button>
       <button type="button" onclick="clearLog()">Clear</button>
     </div>
-    <div class="log" id="log">[ready] join SoftAP CoilControl and wait for linked status…</div>
+    <div class="log" id="log">[ready] join SoftAP CoilControl and wait for linked status… DualSense pairs over Bluetooth.</div>
   </section>
 </main>
 
@@ -841,10 +838,17 @@ async function setAxis(a) {
   await setFieldProgram(kind, a);
 }
 
+async function setFeedback(on) {
+  const ok = await sendCmd(on ? 'fb on' : 'fb off');
+  if (!ok) showBanner('Feedback toggle failed — check link', true);
+  const tg = document.getElementById('fbToggle');
+  if (tg && !ok) tg.checked = !on;
+}
+
 function clampGamma(v) {
   if (!Number.isFinite(v)) return 45;
   if (v < 0) v = 0;
-  if (v > 90) v = 90;
+  if (v > 180) v = 180;
   return v;
 }
 
@@ -873,17 +877,6 @@ async function applyGamma() {
   syncLabels();
 }
 
-async function setMode(m) {
-  await sendCmd('mode ' + m);
-}
-
-async function applyLimit() {
-  let v = +document.getElementById('limVal').value;
-  if (v < 0) v = 0;
-  if (v > 255) v = 255;
-  await sendCmd('limit all ' + v);
-}
-
 async function applyCoil(i) {
   const c = state.coils[i];
   const dir = c.dir >= 0 ? '+' : '-';
@@ -891,11 +884,11 @@ async function applyCoil(i) {
   return await sendCmd(`off M${c.id}`);
 }
 
-function avgI(ids) {
+function avgDuty(ids) {
   let s = 0, n = 0;
   ids.forEach(id => {
     const c = state.coils[id - 1];
-    if (c) { s += (+c.i || 0); n++; }
+    if (c) { s += (+c.duty || 0); n++; }
   });
   return n ? (s / n) : 0;
 }
@@ -908,14 +901,12 @@ function displayAmp() {
 }
 
 function syncLabels() {
-  document.getElementById('cfgModeLabel').textContent = state.mode;
-  document.getElementById('cfgContourLabel').textContent = state.contour ? 'ON' : 'off';
+  const contourEl = document.getElementById('cfgContourLabel');
+  if (contourEl) contourEl.textContent = state.contour ? 'ON' : 'off';
   document.getElementById('cfgRotLabel').textContent = state.rotate ? 'ON' : 'off';
   const axis = state.axis || 'y';
   const prog = state.program || (isRevolveAxis(axis) ? 'revolve' : 'rotate');
   document.getElementById('cfgAxisLabel').textContent = fieldCaption(prog, axis);
-  document.getElementById('modeOpenBtn').classList.toggle('active', state.mode === 'open');
-  document.getElementById('modeClosedBtn').classList.toggle('active', state.mode === 'closed');
   document.getElementById('dirCwBtn').classList.toggle('active', state.rot_dir === 'cw');
   document.getElementById('dirCcwBtn').classList.toggle('active', state.rot_dir === 'ccw');
   const rotY = document.getElementById('progRotYBtn');
@@ -948,14 +939,15 @@ function syncLabels() {
   const stG = document.getElementById('stGamma');
   if (stG) stG.textContent = clampGamma(state.gamma_live != null ? state.gamma_live : state.gamma).toFixed(0);
   document.getElementById('stDir').textContent = state.rot_dir;
-  document.getElementById('stMode').textContent = state.mode;
 
-  const ia = avgI([1, 3]);
-  const ib = avgI([2, 4]);
-  document.getElementById('stIA').textContent = ia.toFixed(3) + ' A';
-  document.getElementById('stIB').textContent = ib.toFixed(3) + ' A';
-  document.getElementById('phaseAI').textContent = ia.toFixed(3);
-  document.getElementById('phaseBI').textContent = ib.toFixed(3);
+  const da = avgDuty([1, 3]);
+  const db = avgDuty([2, 4]);
+  const stDuty = document.getElementById('stDuty');
+  if (stDuty) stDuty.textContent = Math.round(da) + '/' + Math.round(db);
+  const paD = document.getElementById('phaseADuty');
+  const pbD = document.getElementById('phaseBDuty');
+  if (paD) paD.textContent = Math.round(da);
+  if (pbD) pbD.textContent = Math.round(db);
 
   const paTitle = document.getElementById('phaseATitle');
   const pbTitle = document.getElementById('phaseBTitle');
@@ -1232,6 +1224,20 @@ function applyStatus(s) {
     if (mlxB) mlxB.textContent = '—';
     if (mlxCoils) mlxCoils.textContent = '—';
   }
+  if (s.fb && typeof s.fb === 'object') {
+    const fb = s.fb;
+    const tg = document.getElementById('fbToggle');
+    const st = document.getElementById('fbState');
+    const er = document.getElementById('fbErr');
+    const kk = document.getElementById('fbK');
+    if (tg && document.activeElement !== tg) tg.checked = !!(+fb.en);
+    if (st) st.textContent = (+fb.en ? 'on' : 'off') + (+fb.fault ? ' · REFUSED coil(s) — check zsign' : '');
+    if (er) er.textContent = +fb.ok ? ((+fb.err).toFixed(1) + ' % (' + (+fb.updates) + ' updates)') : 'waiting for a steady revolution';
+    if (kk && Array.isArray(fb.k)) {
+      kk.textContent = fb.k.map((k, i) => 'M' + (i + 1) + ' ' + (+k).toFixed(2) + '∠' +
+        (+(fb.ph || [])[i] || 0).toFixed(0) + '°').join(' · ');
+    }
+  }
   s.coils.forEach((c, idx) => {
     if (!state.coils[idx]) return;
     Object.assign(state.coils[idx], c);
@@ -1277,11 +1283,9 @@ function setLink(ok, reason) {
   document.getElementById('linkDot').className = 'dot' + (ok ? ' ok' : '');
   if (ok) {
     document.getElementById('linkText').textContent =
-      `linked · ${state.rotate ? ((liveProgram() === 'revolve') ? 'REV' : 'ROT') : 'DC'} · ${state.mode}`;
-  } else if (reason === 'uart_only') {
-    document.getElementById('linkText').textContent = 'UART up · status stale';
+      `linked · ${state.rotate ? ((liveProgram() === 'revolve') ? 'REV' : 'ROT') : 'DC'}`;
   } else {
-    document.getElementById('linkText').textContent = 'STM32 link lost';
+    document.getElementById('linkText').textContent = 'controller offline';
   }
 }
 
@@ -1317,8 +1321,6 @@ function render(rebuild) {
         </div>
         <div class="readout">
           <div>Duty <b id="duty${idx}">${c.duty}</b></div>
-          <div>Current <b id="amps${idx}">${(+c.i).toFixed(3)} A</b></div>
-          <div>Limit <b id="limr${idx}">${(+c.lim).toFixed(2)} A</b></div>
           <div>State <b id="sten${idx}">${c.en?'ON':'OFF'}</b></div>
         </div>`;
       root.appendChild(d);
@@ -1339,9 +1341,6 @@ function render(rebuild) {
       const magv = document.getElementById('magv' + idx);
       if (magv && document.activeElement !== range) magv.textContent = c.mag;
       document.getElementById('duty' + idx).textContent = c.duty;
-      document.getElementById('amps' + idx).textContent = (+c.i).toFixed(3) + ' A';
-      const limr = document.getElementById('limr' + idx);
-      if (limr) limr.textContent = (+c.lim).toFixed(2) + ' A';
       document.getElementById('sten' + idx).textContent = c.en ? 'ON' : 'OFF';
       const buttons = card.querySelectorAll('.dir button');
       buttons[0].className = 'fwd' + (c.dir >= 0 ? ' active' : '');
@@ -1387,15 +1386,7 @@ async function poll() {
     if (j.status) {
       applyStatus(j.status);
       setLink(true);
-    } else if (j.uart_ok) {
-      // #region agent log
-      dbgLog('H4', 'www_page.h:poll', 'uart up status stale', {uart_ok:j.uart_ok, raw:(j.raw||'').toString().slice(0,120)});
-      // #endregion
-      setLink(false, 'uart_only');
     } else {
-      // #region agent log
-      dbgLog('H4', 'www_page.h:poll', 'status unlinked', {uart_ok:j.uart_ok, raw:(j.raw||'').toString().slice(0,120)});
-      // #endregion
       setLink(false, 'status_unlinked');
     }
     syncLabels();
@@ -1462,8 +1453,27 @@ function resizeWaveCanvas() {
 }
 
 const FIELD_CH = Math.sqrt(3) / 2;
-const FIELD_INV_H = 1 / (2 * FIELD_CH);
-const FIELD_INV_V = 1 / (4 * 0.5);
+const FIELD_CV = 0.5;
+const FIELD_UMAX = 255;
+
+/* Mirrors field_tilt.c: per-coil weights, max gain, shared scale. */
+function tiltWeights(sg, cg) {
+  const cos2g = cg * cg - sg * sg;
+  const wv = 1 / (4 * FIELD_CV);
+  const dw = cos2g * FIELD_CV / (4 * FIELD_CH * FIELD_CH);
+  return { a13: cg / (2 * FIELD_CH), a24: sg / (2 * FIELD_CH), w13: wv - dw, w24: wv + dw };
+}
+
+function tiltMaxGain(sg, cg) {
+  const w = tiltWeights(sg, cg);
+  return 1 / Math.sqrt(Math.max(w.a13 * w.a13 + w.w13 * w.w13, w.a24 * w.a24 + w.w24 * w.w24));
+}
+
+function tiltSharedScale(ah, av, sg, cg) {
+  const w = tiltWeights(sg, cg);
+  const pmax = Math.max(Math.hypot(w.a13 * ah, w.w13 * av), Math.hypot(w.a24 * ah, w.w24 * av));
+  return (pmax > FIELD_UMAX) ? (FIELD_UMAX / pmax) : 1;
+}
 
 function tiltCommandsAt(tSec, ampH, ampV, gammaDeg, ccw) {
   const f = Math.max(0.01, +state.freq || 0);
@@ -1472,19 +1482,14 @@ function tiltCommandsAt(tSec, ampH, ampV, gammaDeg, ccw) {
   const r = clampGamma(gammaDeg) * Math.PI / 180;
   let sg = Math.sin(r), cg = Math.cos(r);
   if (gammaDeg <= 0) { sg = 0; cg = 1; }
-  if (gammaDeg >= 90) { sg = 1; cg = 0; }
-  const p13 = Math.hypot(ampH * cg * FIELD_INV_H, ampV * FIELD_INV_V);
-  const p24 = Math.hypot(ampH * sg * FIELD_INV_H, ampV * FIELD_INV_V);
-  const pmax = Math.max(p13, p24);
-  const s = (pmax > 255) ? (255 / pmax) : 1;
-  const H = (ampH * s) * Math.cos(theta);
-  const V = (ampV * s) * Math.sin(theta);
-  return [
-    -H * cg * FIELD_INV_H + V * FIELD_INV_V,
-     H * sg * FIELD_INV_H + V * FIELD_INV_V,
-    -H * cg * FIELD_INV_H - V * FIELD_INV_V,
-     H * sg * FIELD_INV_H - V * FIELD_INV_V
-  ];
+  else if (gammaDeg === 90) { sg = 1; cg = 0; }
+  else if (gammaDeg >= 180) { sg = 0; cg = -1; }
+  const g = tiltMaxGain(sg, cg);
+  const s = tiltSharedScale(ampH * g, ampV * g, sg, cg);
+  const H = (ampH * g * s) * Math.cos(theta);
+  const V = (ampV * g * s) * Math.sin(theta);
+  const w = tiltWeights(sg, cg);
+  return [-w.a13 * H + w.w13 * V, w.a24 * H + w.w24 * V, -w.a13 * H - w.w13 * V, w.a24 * H - w.w24 * V];
 }
 
 function coilDutyAt(tSec, coilId) {

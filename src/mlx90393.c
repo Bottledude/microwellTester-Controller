@@ -1,19 +1,14 @@
 /**
  * @file mlx90393.c
- * @brief I2C driver for MLX90393 (Melexis Triaxis). Own bus — never I2C1/PCA9685.
- *
- * Commands follow the datasheet / Adafruit protocol:
- *   EX 0x80, RT 0xF0, WR 0x60, RR 0x50, SM 0x30|zyxt, RM 0x40|zyxt
- * RM XYZ order is T,X,Y,Z with only enabled axes: X then Y then Z.
+ * @brief I2C driver for MLX90393. Own bus — never the PCA9685 bus.
  */
 #include "mlx90393.h"
+#include "i2c_bus.h"
 
 #include <string.h>
 
-#define CMD_SB   0x10u
 #define CMD_SM   0x30u
 #define CMD_RM   0x40u
-#define CMD_RR   0x50u
 #define CMD_WR   0x60u
 #define CMD_EX   0x80u
 #define CMD_RT   0xF0u
@@ -26,7 +21,6 @@
 #define GAIN_SHIFT 4u
 #define ST_ERROR   0x10u
 
-/* HALLCONF=0x0C: [gain 0..7][res 0..3][xy,z] µT/LSB (Adafruit table). */
 static const float LSB_UT[8][4][2] = {
   {{0.751f, 1.210f}, {1.502f, 2.420f}, {3.004f, 4.840f}, {6.009f, 9.680f}},
   {{0.601f, 0.968f}, {1.202f, 1.936f}, {2.403f, 3.872f}, {4.840f, 7.744f}},
@@ -38,7 +32,6 @@ static const float LSB_UT[8][4][2] = {
   {{0.150f, 0.242f}, {0.300f, 0.484f}, {0.601f, 0.968f}, {1.202f, 1.936f}},
 };
 
-/* DIG_FILT × OSR conversion time (ms), datasheet 15.1.5. */
 static const uint16_t TCONV_MS[8][4] = {
   {2, 2, 3, 6},
   {2, 3, 4, 7},
@@ -50,26 +43,11 @@ static const uint16_t TCONV_MS[8][4] = {
   {26, 51, 101, 201},
 };
 
-static uint16_t i2c_addr8(const Mlx90393 *dev)
-{
-  return (uint16_t)((uint16_t)dev->addr << 1);
-}
-
-static HAL_StatusTypeDef mlx_tx(Mlx90393 *dev, const uint8_t *buf, uint16_t n)
-{
-  return HAL_I2C_Master_Transmit(dev->i2c, i2c_addr8(dev), (uint8_t *)buf, n, 8);
-}
-
-static HAL_StatusTypeDef mlx_rx(Mlx90393 *dev, uint8_t *buf, uint16_t n)
-{
-  return HAL_I2C_Master_Receive(dev->i2c, i2c_addr8(dev), buf, n, 8);
-}
-
 static uint8_t mlx_cmd_status(Mlx90393 *dev, const uint8_t *tx, uint16_t ntx)
 {
   uint8_t st = 0;
-  if (mlx_tx(dev, tx, ntx) != HAL_OK) return 0x10u;
-  if (mlx_rx(dev, &st, 1) != HAL_OK) return 0x10u;
+  if (!i2c_tx(dev->bus, dev->addr, tx, ntx)) return 0x10u;
+  if (!i2c_rx(dev->bus, dev->addr, &st, 1)) return 0x10u;
   dev->last_status = st;
   return st;
 }
@@ -121,12 +99,12 @@ static void sample_from_rm(Mlx90393 *dev, const uint8_t *rm, MlxSample *out)
   out->sat = sat;
 }
 
-uint8_t MLX90393_Scan(I2C_HandleTypeDef *hi2c, uint8_t *found, uint8_t max)
+uint8_t MLX90393_Scan(uint8_t bus, uint8_t *found, uint8_t max)
 {
   uint8_t n = 0;
-  if (!hi2c || !found || max == 0) return 0;
+  if (!found || max == 0) return 0;
   for (uint8_t a = MLX90393_ADDR_MIN; a <= MLX90393_ADDR_MAX; a++) {
-    if (HAL_I2C_IsDeviceReady(hi2c, (uint16_t)((uint16_t)a << 1), 2, 8) == HAL_OK) {
+    if (i2c_ready(bus, a)) {
       found[n++] = a;
       if (n >= max) break;
     }
@@ -134,37 +112,33 @@ uint8_t MLX90393_Scan(I2C_HandleTypeDef *hi2c, uint8_t *found, uint8_t max)
   return n;
 }
 
-uint8_t MLX90393_Init(Mlx90393 *dev, I2C_HandleTypeDef *hi2c, uint8_t addr)
+uint8_t MLX90393_Init(Mlx90393 *dev, uint8_t bus, uint8_t addr)
 {
   uint8_t cmd;
   uint16_t conf3;
 
-  if (!dev || !hi2c) return 0;
+  if (!dev) return 0;
   memset(dev, 0, sizeof(*dev));
-  dev->i2c = hi2c;
+  dev->bus = bus;
   dev->addr = addr;
-  /* Widest practical range: analog 1x + 19-bit encoding (~±39 mT XY / ±63 mT Z). */
   dev->gain = 7u;
   dev->res = 3u;
   dev->filt = 2u;
   dev->osr = 1u;
   dev->conv_ms = (uint32_t)TCONV_MS[dev->filt][dev->osr] + 2u;
 
-  if (HAL_I2C_IsDeviceReady(hi2c, (uint16_t)((uint16_t)addr << 1), 3, 12) != HAL_OK) {
-    return 0;
-  }
+  if (!i2c_ready(bus, addr)) return 0;
 
   cmd = (uint8_t)CMD_EX;
   (void)mlx_cmd_status(dev, &cmd, 1);
-  HAL_Delay(2);
+  i2c_delay_ms(2);
   cmd = (uint8_t)CMD_RT;
   (void)mlx_cmd_status(dev, &cmd, 1);
-  HAL_Delay(3);
+  i2c_delay_ms(3);
 
   if (mlx_write_reg(dev, REG_CONF1, (uint16_t)((dev->gain << GAIN_SHIFT) | HALLCONF)) & ST_ERROR) {
     return 0;
   }
-  /* CONF3: OSR[1:0], FILT[4:2], RES_X[6:5], RES_Y[8:7], RES_Z[10:9] */
   conf3 = (uint16_t)(dev->osr & 3u);
   conf3 |= (uint16_t)((uint16_t)(dev->filt & 7u) << 2);
   conf3 |= (uint16_t)((uint16_t)(dev->res & 3u) << 5);
@@ -185,7 +159,7 @@ uint8_t MLX90393_StartMeasure(Mlx90393 *dev)
   if (!dev || !dev->present) return 0;
   cmd = (uint8_t)(CMD_SM | AXIS_XYZ);
   if (mlx_cmd_status(dev, &cmd, 1) & ST_ERROR) return 0;
-  dev->sm_tick = HAL_GetTick();
+  dev->sm_tick = i2c_millis();
   if (dev->sm_tick == 0u) dev->sm_tick = 1u;
   return 1;
 }
@@ -197,15 +171,15 @@ uint8_t MLX90393_ReadIfReady(Mlx90393 *dev, MlxSample *out)
   uint32_t now;
 
   if (!dev || !dev->present || !out || dev->sm_tick == 0u) return 0;
-  now = HAL_GetTick();
+  now = i2c_millis();
   if ((now - dev->sm_tick) < dev->conv_ms) return 0;
 
   cmd = (uint8_t)(CMD_RM | AXIS_XYZ);
-  if (mlx_tx(dev, &cmd, 1) != HAL_OK) {
+  if (!i2c_tx(dev->bus, dev->addr, &cmd, 1)) {
     dev->sm_tick = 0;
     return 0;
   }
-  if (mlx_rx(dev, rm, 7) != HAL_OK) {
+  if (!i2c_rx(dev->bus, dev->addr, rm, 7)) {
     dev->sm_tick = 0;
     return 0;
   }
@@ -218,11 +192,10 @@ uint8_t MLX90393_ReadBlocking(Mlx90393 *dev, MlxSample *out)
 {
   uint32_t t0;
   if (!MLX90393_StartMeasure(dev)) return 0;
-  t0 = HAL_GetTick();
-  while ((HAL_GetTick() - t0) < (dev->conv_ms + 8u)) {
+  t0 = i2c_millis();
+  while ((i2c_millis() - t0) < (dev->conv_ms + 8u)) {
     if (MLX90393_ReadIfReady(dev, out)) return 1;
   }
-  /* One last attempt after the wait window. */
   return MLX90393_ReadIfReady(dev, out);
 }
 
