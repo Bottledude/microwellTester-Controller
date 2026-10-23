@@ -248,6 +248,7 @@ static void CLI_PrintHelp(void)
     "rev_hv <h%> <v%>             Ah=amp*gain*h/100 Av=amp*gain*v/100 (100 100=circle)\r\n"
     "rot_dir cw|ccw               rotate: sign of sin pair; revolve: omega -> -omega\r\n"
     "corner Q0|Q1|Q2|Q3|run       park revolve at a cardinal, or resume stepping\r\n"
+    "aim <deg>|run               slew phase to stick angle (0=right, 90=up), or resume spin\r\n"
     "contour on|off               enable M1..M4 together (DC contour)\r\n"
     "program P1|P2|stop           preset patterns\r\n"
     "json                         machine-readable status (web UI)\r\n"
@@ -301,6 +302,12 @@ static void CLI_PrintStatus(void)
                 g_revolve_travel ? " (traveling)" : " (parked)");
   } else {
     uart_write("corner=run\r\n");
+  }
+  if (g_aim_hold) {
+    uart_printf("aim=%.0f deg\r\n",
+                (double)g_aim_elec * (360.0 / 4294967296.0));
+  } else {
+    uart_write("aim=run\r\n");
   }
   uart_printf("pwm=%u Hz pca9685  sine=%u Hz  coils=%d  pca=%s\r\n",
               (unsigned)PWM_TARGET_HZ, (unsigned)SINE_UPDATE_HZ, NUM_COILS,
@@ -364,7 +371,7 @@ static void CLI_HandleLine(char *line)
                  "\"gamma\":%.2f,\"gamma_live\":%.2f,\"tilt_scale\":%.4f,"
                  "\"rev_gain\":%.4f,"
                  "\"rot_dir\":\"%s\",\"rot_dir_live\":\"%s\",\"n\":%d,"
-                 "\"corner\":%d,\"park\":%u,\"travel\":%u,"
+                 "\"corner\":%d,\"park\":%u,\"travel\":%u,\"aim\":%u,"
                  "\"signed\":[%d,%d,%d,%d],"
                  "\"pr\":[%u,%u,%u,%u],\"pl\":[%u,%u,%u,%u],\"coils\":[",
                  (unsigned)g_contour_active,
@@ -388,6 +395,7 @@ static void CLI_HandleLine(char *line)
                  g_revolve_park ? (int)g_revolve_corner : -1,
                  (unsigned)g_revolve_park,
                  (unsigned)g_revolve_travel,
+                 (unsigned)g_aim_hold,
                  (int)sd[0], (int)sd[1], (int)sd[2], (int)sd[3],
                  (unsigned)pr[0], (unsigned)pr[1], (unsigned)pr[2], (unsigned)pr[3],
                  (unsigned)pl[0], (unsigned)pl[1], (unsigned)pl[2], (unsigned)pl[3]);
@@ -721,6 +729,25 @@ static void CLI_HandleLine(char *line)
       uart_printf("corner=Q%u (%s)\r\n", (unsigned)q,
                   q == 0 ? "+Bh" : q == 1 ? "+Bv" : q == 2 ? "-Bh" : "-Bv");
     }
+    return;
+  }
+  if (!strcmp(cmd, "aim")) {
+    float deg;
+    double wrapped;
+    if (argc < 2) {
+      uart_write("usage: aim <deg>|run\r\n");
+      return;
+    }
+    if (str_ieq(argv[1], "run") || str_ieq(argv[1], "off")) {
+      Field_AimRun();
+      uart_write("aim=run\r\n");
+      return;
+    }
+    deg = (float)atof(argv[1]);
+    Field_AimDeg(deg);
+    wrapped = fmod((double)deg, 360.0);
+    if (wrapped < 0.0) wrapped += 360.0;
+    uart_printf("aim=%.0f\r\n", wrapped);
     return;
   }
   if (!strcmp(cmd, "rev_hv") || !strcmp(cmd, "revhv") || !strcmp(cmd, "ellipse")) {

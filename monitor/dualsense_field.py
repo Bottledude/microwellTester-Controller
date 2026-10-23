@@ -13,23 +13,25 @@ writes the same CLI commands as the Serial Monitor.
 This script owns the Serial Monitor port. Close pio device monitor / Teleplot
 on UART0 first.
 
-Mapping (firmware γ is the field axis in XZ, 0–180°; changes while running
-ramp amp through 0 — analog values are quantized and sent only on change):
+Mapping (a tap steps once; holding D-pad repeats. γ changes while running
+still ramp amp through 0):
 
-  D-pad Up/Left/Right/Down   axis y / x / z / tilt
+  Square / Cross / Circle / Triangle   axis y / x / z / tilt
   Options                    start (rotate on / revolve <axis>)
   Create                     stop  (rotate off)
   PS                         ALL OFF (off all — immediate)
   L1 / R1                    rot_dir ccw / cw
-  Square / Cross / Circle / Triangle   corner Q0 / Q1 / Q2 / Q3
-  Left stick X               gamma 0..180 (deadzone holds last)
-  Right stick X              amp 0..255 (deadzone holds last)
-  Right stick Y              slew freq while held
+  L2 + D-pad Up/Down         amp ±5
+  R2 + D-pad Up/Down         gamma ±5°
+  L2+R2 + D-pad Up/Down      freq (finer steps below 1 Hz)
+  Right stick                aim field angle; center resumes rotation
+  L3                         fb on / off
   Touchpad click             status
 """
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import threading
@@ -43,9 +45,11 @@ DEAD = 0.25
 GAMMA_STEP = 5.0
 AMP_STEP = 5
 FREQ_MIN, FREQ_MAX = 0.01, 50.0
-FREQ_SLEW_HZ_PER_S = 4.0
 CMD_GAP_S = 0.08
 POLL_S = 0.02
+ADJ_DELAY_S = 0.35
+ADJ_REPEAT_S = 0.12
+AIM_STEP_DEG = 2
 
 PAD_HINTS = (
     "dualsense",
@@ -288,12 +292,14 @@ class Pad:
             f"hats={self.js.get_numhats()} layout={layout}"
         )
         self._prev_btn = [0] * max(self.js.get_numbuttons(), 16)
-        self._prev_hat = (0, 0)
         self._axis_prog = "y"
         self._gamma = 45.0
-        self._amp: int | None = None
+        self._amp = 0
         self._freq = 1.0
-        self._freq_sent: float | None = None
+        self._fb = False
+        self._aim: int | None = None
+        self._adj_key: tuple[str, int] | None = None
+        self._adj_wait = 0.0
 
     def pump(self) -> None:
         _import_pygame().event.pump()
@@ -330,6 +336,71 @@ class Pad:
             return (0, 0)
         return self.js.get_hat(0)
 
+    def _trigger_held(self, name: str) -> bool:
+        if self._btn(name):
+            return True
+        idx = 4 if name == "l2" else 5
+        return self._axis(idx) > 0.05
+
+    def _dpad_ud(self) -> int:
+        if self.js.get_numhats() >= 1:
+            _hx, hy = self._hat()
+            if hy == 1:
+                return 1
+            if hy == -1:
+                return -1
+        if self._btn("dpad_up"):
+            return 1
+        if self._btn("dpad_down"):
+            return -1
+        return 0
+
+    @staticmethod
+    def _freq_stepped(cur: float, direction: int) -> float:
+        if cur < 0.1:
+            step = 0.01
+        elif cur < 1.0:
+            step = 0.05
+        elif cur < 10.0:
+            step = 0.25
+        else:
+            step = 1.0
+        cur += direction * step
+        if cur < FREQ_MIN:
+            cur = FREQ_MIN
+        if cur > FREQ_MAX:
+            cur = FREQ_MAX
+        return round(cur, 2)
+
+    def _step_value(self, mode: str, direction: int, out: list[tuple[str, bool]]) -> None:
+        if mode == "amp":
+            a = self._amp + direction * AMP_STEP
+            if a < 0:
+                a = 0
+            if a > 255:
+                a = 255
+            if a == self._amp:
+                return
+            self._amp = a
+            out.append((f"amp {a}", False))
+        elif mode == "gamma":
+            g = self._gamma + direction * GAMMA_STEP
+            if g < 0.0:
+                g = 0.0
+            if g > 180.0:
+                g = 180.0
+            g = round(g)
+            if g == self._gamma:
+                return
+            self._gamma = g
+            out.append((f"gamma {g:.0f}", False))
+        else:
+            f = self._freq_stepped(self._freq, direction)
+            if f == self._freq:
+                return
+            self._freq = f
+            out.append((f"freq {f:.2f}", False))
+
     def collect(self, dt: float, debug: bool) -> list[tuple[str, bool]]:
         """Return (cmd, urgent) edges + analog holds for this frame."""
         out: list[tuple[str, bool]] = []
@@ -341,37 +412,41 @@ class Pad:
                 print(f"  buttons {pressed} hat={self._hat()} "
                       f"axes={[round(self._axis(i), 2) for i in range(self.js.get_numaxes())]}")
 
-        hat = self._hat()
-        if hat != self._prev_hat:
-            hx, hy = hat
-            if hy == 1:
-                self._axis_prog = "y"
-                out.append(("axis y", False))
-            elif hx == -1:
-                self._axis_prog = "x"
-                out.append(("axis x", False))
-            elif hx == 1:
-                self._axis_prog = "z"
-                out.append(("axis z", False))
-            elif hy == -1:
-                self._axis_prog = "tilt"
-                out.append(("axis tilt", False))
-            self._prev_hat = hat
-
-        dpad_map = (
-            ("dpad_up", "y"),
-            ("dpad_left", "x"),
-            ("dpad_right", "z"),
-            ("dpad_down", "tilt"),
+        face = (
+            ("square", "y"),
+            ("cross", "x"),
+            ("circle", "z"),
+            ("triangle", "tilt"),
         )
-        if self.js.get_numhats() < 1:
-            for name, ax in dpad_map:
-                if self._edge(name):
-                    self._axis_prog = ax
-                    out.append((f"axis {ax}", False))
+        for name, ax in face:
+            if self._edge(name):
+                self._axis_prog = ax
+                out.append((f"axis {ax}", False))
+
+        l2 = self._trigger_held("l2")
+        r2 = self._trigger_held("r2")
+        if l2 and r2:
+            mode = "freq"
+        elif l2:
+            mode = "amp"
+        elif r2:
+            mode = "gamma"
         else:
-            for name, _ax in dpad_map:
-                self._edge(name)
+            mode = ""
+        ud = self._dpad_ud()
+        if mode and ud:
+            key = (mode, ud)
+            if key != self._adj_key:
+                self._adj_key = key
+                self._adj_wait = ADJ_DELAY_S
+                self._step_value(mode, ud, out)
+            else:
+                self._adj_wait -= dt
+                if self._adj_wait <= 0.0:
+                    self._adj_wait = ADJ_REPEAT_S
+                    self._step_value(mode, ud, out)
+        else:
+            self._adj_key = None
 
         if self._edge("options"):
             if self._axis_prog == "y":
@@ -388,54 +463,26 @@ class Pad:
             out.append(("rot_dir ccw", False))
         if self._edge("r1"):
             out.append(("rot_dir cw", False))
-        if self._edge("square"):
-            out.append(("corner Q0", False))
-        if self._edge("cross"):
-            out.append(("corner Q1", False))
-        if self._edge("circle"):
-            out.append(("corner Q2", False))
-        if self._edge("triangle"):
-            out.append(("corner Q3", False))
+        if self._edge("l3"):
+            self._fb = not self._fb
+            out.append(("fb on" if self._fb else "fb off", False))
         if self._edge("touchpad"):
             out.append(("status", False))
 
-        lx = self._axis(0)
-        if abs(lx) >= DEAD:
-            g = (lx + 1.0) * 90.0
-            g = round(g / GAMMA_STEP) * GAMMA_STEP
-            if g < 0.0:
-                g = 0.0
-            if g > 180.0:
-                g = 180.0
-            if abs(g - self._gamma) >= (GAMMA_STEP - 0.01):
-                self._gamma = g
-                out.append((f"gamma {g:.0f}", False))
-
         rx = self._axis(2) if self.js.get_numaxes() > 2 else 0.0
-        if abs(rx) >= DEAD:
-            a = int(round((rx + 1.0) * 0.5 * 255.0 / AMP_STEP) * AMP_STEP)
-            if a < 0:
-                a = 0
-            if a > 255:
-                a = 255
-            if self._amp is None or a != self._amp:
-                self._amp = a
-                out.append((f"amp {a}", False))
-
         ry = self._axis(3) if self.js.get_numaxes() > 3 else 0.0
-        if abs(ry) >= DEAD:
-            # Stick Y is usually inverted (up = -1).
-            self._freq += (-ry) * FREQ_SLEW_HZ_PER_S * dt
-            if self._freq < FREQ_MIN:
-                self._freq = FREQ_MIN
-            if self._freq > FREQ_MAX:
-                self._freq = FREQ_MAX
-            q = round(self._freq * 4.0) / 4.0
-            if q < FREQ_MIN:
-                q = FREQ_MIN
-            if q != self._freq_sent:
-                self._freq_sent = q
-                out.append((f"freq {q:.2f}", False))
+        mag = math.hypot(rx, ry)
+        if mag >= DEAD:
+            # Stick Y is up = -1. 0° = right, 90° = up.
+            ang = math.degrees(math.atan2(-ry, rx)) % 360.0
+            q = int(round(ang)) % 360
+            delta = 0 if self._aim is None else (q - self._aim + 180) % 360 - 180
+            if self._aim is None or delta <= -AIM_STEP_DEG or delta >= AIM_STEP_DEG:
+                self._aim = q
+                out.append((f"aim {q}", False))
+        elif self._aim is not None:
+            self._aim = None
+            out.append(("aim run", False))
 
         return out
 
@@ -455,18 +502,19 @@ def print_map() -> None:
     print(
         """
 Controls
-  D-pad Up      axis y     rotate Y (XZ)
-  D-pad Left    axis x     revolve X (YZ, γ=0)
-  D-pad Right   axis z     revolve Z (XY, γ=90)
-  D-pad Down    axis tilt  revolve tilt (live γ)
+  □ Square      axis y     rotate Y (XZ)
+  ✕ Cross       axis x     revolve X (YZ, γ=0)
+  ○ Circle      axis z     revolve Z (XY, γ=90)
+  △ Triangle    axis tilt  revolve tilt (live γ)
   Options       START      rotate on / revolve <axis>
   Create        STOP       rotate off (ramp)
   PS            ALL OFF    off all (immediate)
   L1 / R1       rot_dir    ccw / cw
-  □ / ✕ / ○ / △  corner    Q0 / Q1 / Q2 / Q3
-  Left stick X  gamma      0° … 180°  (rest = hold)
-  Right stick X amp        0 … 255   (rest = hold)
-  Right stick Y freq       slew 0.01–50 Hz
+  L2 + Up/Down  amp        ±5 (tap once, hold repeats)
+  R2 + Up/Down  gamma      ±5°
+  L2+R2 + Up/Down  freq    steps 0.01–50 Hz
+  Right stick   aim        point the field; center resumes rotation
+  L3            fb         MLX feedback on / off
   Touchpad      status
 """
     )

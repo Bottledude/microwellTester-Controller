@@ -31,6 +31,8 @@ extern volatile uint8_t g_revolve_env_peak;
 extern volatile uint8_t g_revolve_park;
 extern volatile uint8_t g_revolve_corner;
 extern volatile uint8_t g_revolve_travel;
+extern volatile uint8_t g_aim_hold;     /* 1: slew phase to g_aim_elec, do not spin */
+extern volatile uint32_t g_aim_elec;    /* electrical phase, CW convention (CCW negates) */
 extern volatile uint8_t g_fb_apply;     /* 1: sample tick uses the MLX-corrected drive */
 
 const char *rotate_dir_str(RotateDir d);
@@ -59,6 +61,9 @@ void Tilt_CommitGamma(float deg);
 void Tilt_SetGamma(float deg);
 void Revolve_ClearPark(void);
 void Revolve_GotoCorner(uint8_t q);
+/* Stick aim: slew to electrical degrees (0 = +Bh / stick right, 90 = +Bv / stick up). */
+void Field_AimDeg(float deg);
+void Field_AimRun(void); /* release aim; rotation continues from the current phase */
 void Rotate_StopIfDcConflict(uint8_t idx);
 void Rotate_RampUpdate(void);
 void Field_SampleTick(void);

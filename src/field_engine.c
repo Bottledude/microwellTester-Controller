@@ -29,6 +29,8 @@ volatile uint8_t  g_revolve_env_peak;
 volatile uint8_t  g_revolve_park;
 volatile uint8_t  g_revolve_corner;
 volatile uint8_t  g_revolve_travel;
+volatile uint8_t  g_aim_hold;
+volatile uint32_t g_aim_elec;
 volatile uint8_t  g_fb_apply;
 /* MLX feedback correction per coil, time convention (CCW conjugates it). */
 static FbCplx     s_fb_k[NUM_COILS] = {
@@ -303,7 +305,7 @@ uint8_t Field_FbSteady(void)
   if (!g_rotate_active || g_rotate_stop_pending) return 0;
   if (g_rotate_amp_live == 0 || g_rotate_amp_live != g_rotate_amp) return 0;
   if (g_field_prog != g_field_prog_want || g_rotate_dir != g_rotate_dir_want) return 0;
-  if (g_revolve_phase_hold || g_revolve_park || g_revolve_travel) return 0;
+  if (g_revolve_phase_hold || g_revolve_park || g_revolve_travel || g_aim_hold) return 0;
   if (field_is_tilt(g_field_prog) && g_tilt_gamma_live != g_tilt_gamma_want) return 0;
   return 1;
 }
@@ -369,6 +371,56 @@ void Revolve_ClearPark(void)
 {
   g_revolve_park = 0;
   g_revolve_travel = 0;
+}
+
+/* Shortest-arc step at the fastest rotate the rig already uses (50 Hz). */
+static uint32_t aim_slew_step(void)
+{
+  double inc = ((double)ROTATE_FREQ_MAX_HZ / (double)SINE_UPDATE_HZ) * 4294967296.0;
+  if (inc < 1.0) inc = 1.0;
+  if (inc > 4294967295.0) inc = 4294967295.0;
+  return (uint32_t)inc;
+}
+
+static void phase_slew_toward(uint32_t tgt, uint32_t step)
+{
+  uint32_t ahead = tgt - g_phase;
+  if (ahead == 0u) return;
+  if (ahead <= 0x80000000u) {
+    if (ahead <= step) g_phase = tgt;
+    else g_phase += step;
+  } else {
+    uint32_t back = 0u - ahead;
+    if (back <= step) g_phase = tgt;
+    else g_phase -= step;
+  }
+}
+
+void Field_AimDeg(float deg)
+{
+  double d = fmod((double)deg, 360.0);
+  if (d < 0.0) d += 360.0;
+  if (d >= 360.0) d = 0.0;
+  g_aim_elec = (uint32_t)(d * (4294967296.0 / 360.0));
+  g_revolve_travel = 0;
+  g_aim_hold = 1;
+}
+
+void Field_AimRun(void)
+{
+  uint8_t steady;
+  g_aim_hold = 0;
+  if (!g_revolve_park) return;
+  Revolve_ClearPark();
+  steady = (g_rotate_active && !g_rotate_stop_pending &&
+            g_rotate_amp_live == g_rotate_amp &&
+            g_field_prog == g_field_prog_want &&
+            g_rotate_dir == g_rotate_dir_want) ? 1 : 0;
+  if (steady && field_is_tilt(g_field_prog) &&
+      g_tilt_gamma_live != g_tilt_gamma_want) {
+    steady = 0;
+  }
+  if (steady) g_revolve_phase_hold = 0;
 }
 
 void Revolve_GotoCorner(uint8_t q)
@@ -630,7 +682,11 @@ void Field_SampleTick(void)
   prog = g_field_prog;
   hold = g_revolve_phase_hold;
   travel = g_revolve_travel;
-  if (prog == FIELD_ROTATE_Y) {
+  if (g_aim_hold) {
+    uint32_t tgt = g_aim_elec;
+    if (g_rotate_dir == ROT_CCW) tgt = 0u - tgt;
+    phase_slew_toward(tgt, aim_slew_step());
+  } else if (prog == FIELD_ROTATE_Y) {
     g_phase += g_phase_inc;
   } else if (travel) {
     uint32_t prev = g_phase;

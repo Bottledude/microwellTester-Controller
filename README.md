@@ -210,18 +210,19 @@ That process **owns UART0**. Close `pio device monitor` and Teleplot on that por
 
 | Pad | CLI |
 |-----|-----|
-| D-pad Up / Left / Right / Down | `axis y` / `x` / `z` / `tilt` |
+| □ / ✕ / ○ / △ | `axis y` / `x` / `z` / `tilt` |
 | Options | START (`rotate on` or `revolve <axis>`) |
 | Create | STOP (`rotate off`) |
 | PS | `off all` (immediate) |
 | L1 / R1 | `rot_dir ccw` / `cw` |
-| □ / ✕ / ○ / △ | `corner Q0` / `Q1` / `Q2` / `Q3` |
-| Left stick X | `gamma 0..180` (5° steps; rest holds) |
-| Right stick X | `amp 0..255` (rest holds) |
-| Right stick Y | slew `freq` |
+| L2 + D-pad Up / Down | `amp` ±5 (tap once; hold repeats) |
+| R2 + D-pad Up / Down | `gamma` ±5° |
+| L2 and R2 together + D-pad Up / Down | `freq` (0.01 Hz steps below 0.1 Hz, then 0.05 / 0.25 / 1 Hz) |
+| Right stick | `aim <deg>` — point the field; center sends `aim run` |
+| L3 | `fb on` / `fb off` |
 | Touchpad / mute | `status` |
 
-Changing `gamma` / program while the field is on still ramps amp through 0.
+Stick angle 0° is right, 90° is up, 180° is left, 270° is down. That angle is the synthesis phase: 0° = +Bh (Q0), 90° = +Bv (Q1). The sample tick slews along the short arc at 50 Hz, so the field reaches the stick in at most half a turn (10 ms) and holds there. Releasing the stick resumes rotation from that phase. Aim does not fade amplitude. Changing `gamma` / program while the field is on still ramps amp through 0.
 
 ### Waveform observe (Teleplot)
 
@@ -293,7 +294,7 @@ revolve tilt 0.5 80
 
 `gamma 0` is the YZ plane (axis +X). `gamma 90` is the XY plane (axis +Z). `gamma 135` is the axis between +Z and −X. `gamma 180` is the YZ plane again (axis −X, so the rotation runs the other way). Out-of-range values (`gamma 181`, `gamma -1`) are rejected and leave state unchanged. Unequal `rev_hv` in this mode is an ellipse. If a coil would exceed ±255, all four commands share one scale (`tilt_scale` in `status` / `json` / Teleplot).
 
-Park at a cardinal with `corner Q0` … `Q3` (aliases `q0`…`q3`). Q0=+Bh (+h in tilt), Q1=+Bv (+Y), Q2=−Bh, Q3=−Bv. If the field is off this starts revolve (default Z, or the current tilt/X/Z program if already selected) and sine-swells into that corner. If already revolving, phase travels the circle and holds. `corner run` resumes stepping. You can change program / `rot_dir` / `amp` / `gamma` while the field is on; live amplitude fades through 0 before the new setpoint. `axis y|x|z|tilt` selects the program without starting.
+Park at a cardinal with `corner Q0` … `Q3` (aliases `q0`…`q3`). Q0=+Bh (+h in tilt), Q1=+Bv (+Y), Q2=−Bh, Q3=−Bv. If the field is off this starts revolve (default Z, or the current tilt/X/Z program if already selected) and sine-swells into that corner. If already revolving, phase travels the circle and holds. `corner run` resumes stepping. `aim <deg>` slews to that same phase immediately (short arc, 50 Hz) and holds it; `aim run` resumes stepping. The DualSense right stick sends these. You can change program / `rot_dir` / `amp` / `gamma` while the field is on; live amplitude fades through 0 before the new setpoint. `axis y|x|z|tilt` selects the program without starting.
 
 Host math checks (no hardware):
 
@@ -306,7 +307,7 @@ bash monitor/run_field_tests.sh
 
 **Immediate cuts:** `off all`, web **ALL OFF**, DC writes to M1–M4, `contour`, `program` (including `program stop`).
 
-`status` reports commanded `program` / `axis` / `rot_dir` / `gamma`, plus `amp` and `amp_live`. `json` also reports `program_live`, `axis_live`, `rot_dir_live`, `gamma_live`, `tilt_scale`, `rev_gain` (|B| per amp for the commanded plane) (what the sine sample is using during a fade), and `mlx`: `ok`, `n` (chips present), `sat`, top-level `bx/by/bz/babs` (reconstructed centre, mT), `mlx.center` (same), and `mlx.coils[4]` (`ok`, `addr`, `sat`, `k`, per-chip lab `bx/by/bz/babs`). The JSON `rotate` flag is 1 whenever the sine sample is running (rotate or revolve). PWM-proxy units are not millitesla. `fb`: `en`, `ok`, `err` (%), `updates`, `fault` (bit per refused coil), `gain` (mT per duty), `k[4]` (correction magnitude), `ph[4]` (correction phase, deg).
+`status` reports commanded `program` / `axis` / `rot_dir` / `gamma`, plus `amp` and `amp_live`. `json` also reports `program_live`, `axis_live`, `rot_dir_live`, `gamma_live`, `tilt_scale`, `rev_gain` (|B| per amp for the commanded plane) (what the sine sample is using during a fade), `aim` (1 while the stick is holding phase), and `mlx`: `ok`, `n` (chips present), `sat`, top-level `bx/by/bz/babs` (reconstructed centre, mT), `mlx.center` (same), and `mlx.coils[4]` (`ok`, `addr`, `sat`, `k`, per-chip lab `bx/by/bz/babs`). The JSON `rotate` flag is 1 whenever the sine sample is running (rotate or revolve). PWM-proxy units are not millitesla. `fb`: `en`, `ok`, `err` (%), `updates`, `fault` (bit per refused coil), `gain` (mT per duty), `k[4]` (correction magnitude), `ph[4]` (correction phase, deg).
 
 ### MLX behind coils
 
